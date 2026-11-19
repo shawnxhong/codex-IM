@@ -10,7 +10,7 @@
   - 每个 thread 和 turn 都显式传 model。
 - [ ] `core/sessions`：SQLite 中的映射、每会话的锁、steer 或排队策略、resume 失败时的降级。
 - [ ] `core/router` 和命令：`/new` `/stop` `/status` `/model` `/provider` `/compact` `/help`；运行中可用的命令绕过排队。
-- [ ] `core/render`：节流流式、前缀稳定草稿、最终结果用编辑落定、分段、超长输出转文件。
+- [ ] `core/render`：节流流式、前缀稳定草稿、最终结果用编辑落定、按平台上限分段。
 - [ ] 认证：ChatGPT device auth 和自定义 provider 两种模式；entrypoint 生成 `config.toml`。
 - [ ] 部署：两个镜像、compose、egress-proxy 白名单、stdio-over-TCP 中继。
 - [ ] **验证项**：
@@ -18,11 +18,15 @@
   - Docker 里 Codex `full_access` 能正常执行命令；
   - 实测 ChatGPT 模式需要放行的出网域名。
 - [ ] 冒烟测试 `python -m codex_im.smoke`。
-- [ ] 首批参考平台：**待确认**（建议飞书和 Telegram）。
+- [ ] 首批平台（已确定）：**飞书、Telegram、微信（个人号）、Email**。
+  - 飞书、Telegram：可以编辑消息，做节流流式输出。
+  - 微信、Email：不能编辑消息，只发最终结果；微信在生成过程中显示"正在输入"。
+  - 微信：提供扫码登录命令 `python -m codex_im.platforms.weixin.login`（在 bridge 容器里运行，终端显示二维码）。
+  - Email：校验 `Authentication-Results`，过滤自动邮件，按邮件线程建会话。
 
 ## P1：其余出站长连接平台（A 类）
 
-P0 未覆盖的全部 A 类平台：Discord、Slack、钉钉、企业微信（智能机器人）、QQ 机器人、微信（个人号）、Mattermost、Matrix、IRC、Email、ntfy、Google Chat（Pub/Sub 拉取模式）。
+P0 未覆盖的全部 A 类平台：Discord、Slack、钉钉、企业微信（智能机器人）、QQ 机器人、Mattermost、Matrix、IRC、ntfy、Google Chat（Pub/Sub 拉取模式）。
 
 另外：管理员 `/login` 命令（在 IM 里完成 ChatGPT device auth）；图片入站。
 
@@ -38,8 +42,12 @@ Signal（signal-cli）、SimpleX、WhatsApp 个人号（Baileys）、iMessage（
 
 ## P4：增强项（按需）
 
-- 出站文件投递（opt-in 的 `send_file` MCP 工具，需要权衡是否算引入了 harness）。
 - 语音消息（STT 和 TTS）。
 - IM 内人工审批（需要解决 SDK approval handler 同步阻塞的问题；只在非容器沙箱的部署形态下才有意义）。
 - 用 gVisor 运行 agent。
 - 多实例 / 多租户。
+
+## 已确定不做
+
+- 往 IM 回传 Codex 生成的文件（包括 `send_file` 工具）。
+- 群聊按用户拆分会话。

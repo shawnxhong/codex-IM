@@ -6,22 +6,31 @@
 - 依赖版本是 Hermes 当前锁定的版本，仅作参考，实现时以本项目自己的锁定为准。
 - 各平台的渲染能力（能否编辑消息、单条长度上限、Markdown 方言）在实现适配器时用 `Capabilities` 声明，并回填到本表。
 
+## P0 平台实现要点
+
+| 平台 | 流式输出 | 会话键 | 要点（参考 Hermes 的实现） |
+|---|---|---|---|
+| 飞书 | 编辑消息 | 私聊 / 群（话题群按话题） | `lark-oapi` 长连接；`FEISHU_DOMAIN` 区分飞书（国内）和 Lark（国际）；群聊必须 @ 机器人；Markdown 转成飞书富文本或卡片 |
+| Telegram | 编辑消息（`editMessageText`） | 私聊 / 群（forum 群按 topic） | 长轮询；同一个 token 只能有一个进程在轮询，**不能和宿主机上的 Hermes 共用 bot**；Markdown 转成 Telegram HTML |
+| 微信（个人号） | 不支持编辑，只发最终结果，生成中显示"正在输入"（`sendtyping`） | 私聊 / 群 | iLink 长轮询 `getupdates`；**每条回复都必须带上对方最新的 `context_token`**（需要持久化）；扫码登录（`get_bot_qrcode` / `get_qrcode_status`）；依赖 aiohttp、cryptography；纯文本输出 |
+| Email | 不支持编辑，只发最终结果 | 邮件线程（`In-Reply-To` / `References`） | IMAP 轮询 + SMTP；**发件人必须通过 `Authentication-Results` 校验**（authserv-id 等于 `EMAIL_AUTHSERV_ID`）；丢弃 `Auto-Submitted`、`Precedence: bulk/list/junk`、`X-Auto-Response-Suppress`、`List-Unsubscribe` 等自动邮件；回复时带上线程头；正文长度设上限（Hermes 用的是 50k） |
+
 ## A. 出站长连接：不需要公网入口
 
 | # | 平台 | 接入方式 | SDK / 依赖（Hermes 参考） | 主要凭证 | 阶段 |
 |---|---|---|---|---|---|
-| 1 | Telegram | Bot API 长轮询（也可选 webhook） | `python-telegram-bot` 22.8 | `TELEGRAM_BOT_TOKEN` | P0 候选 |
-| 2 | 飞书 / Lark | 开放平台 WebSocket 长连接（也可选 webhook） | `lark-oapi` | `FEISHU_APP_ID` `FEISHU_APP_SECRET` `FEISHU_DOMAIN` | P0 候选 |
+| 1 | Telegram | Bot API 长轮询（也可选 webhook） | `python-telegram-bot` 22.8 | `TELEGRAM_BOT_TOKEN` | **P0** |
+| 2 | 飞书 / Lark | 开放平台 WebSocket 长连接（也可选 webhook） | `lark-oapi` | `FEISHU_APP_ID` `FEISHU_APP_SECRET` `FEISHU_DOMAIN` | **P0** |
 | 3 | Discord | Gateway WebSocket | `discord.py` 2.7.1 | `DISCORD_BOT_TOKEN` | P1 |
 | 4 | Slack | Socket Mode | `slack-bolt` 1.30.0 / `slack-sdk` 3.45.0 | `SLACK_BOT_TOKEN` `SLACK_APP_TOKEN` | P1 |
 | 5 | 钉钉 | Stream 模式 | `dingtalk-stream` ≥0.20 | `DINGTALK_CLIENT_ID` `DINGTALK_CLIENT_SECRET` | P1 |
 | 6 | 企业微信（智能机器人） | WebSocket | 无专用 SDK（自实现） | `WECOM_BOT_ID` `WECOM_SECRET` `WECOM_WEBSOCKET_URL` | P1 |
 | 7 | QQ 机器人 | 官方 Bot API v2：WebSocket 收事件、REST 发消息 | 无专用 SDK（自实现） | `QQ_APP_ID` `QQ_CLIENT_SECRET` | P1 |
-| 8 | 微信（个人号） | 腾讯 iLink Bot API：长轮询 `getupdates`；首次需扫码登录；媒体走 AES-128-ECB 加密的 CDN | 无专用 SDK（自实现） | `WEIXIN_ACCOUNT_ID` `WEIXIN_TOKEN` | P1 |
+| 8 | 微信（个人号） | 腾讯 iLink Bot API：长轮询 `getupdates`；首次需扫码登录；媒体走 AES-128-ECB 加密的 CDN | 无专用 SDK（自实现） | `WEIXIN_ACCOUNT_ID` `WEIXIN_TOKEN` | **P0** |
 | 9 | Mattermost | REST v4 + WebSocket 事件流 | 无专用 SDK | `MATTERMOST_URL` `MATTERMOST_TOKEN` | P1 |
 | 10 | Matrix | homeserver sync，可选 E2EE | `mautrix[encryption]` 0.21.1（`python-olm` 只能在 Linux 上构建） | `MATRIX_HOMESERVER` `MATRIX_ACCESS_TOKEN` | P1 |
 | 11 | IRC | TCP/TLS | 标准库 asyncio | `IRC_SERVER` `IRC_CHANNEL` `IRC_NICKNAME` | P1 |
-| 12 | Email | IMAP 轮询 + SMTP 发信 | 标准库 | `EMAIL_ADDRESS` `EMAIL_PASSWORD` `EMAIL_IMAP_HOST` `EMAIL_SMTP_HOST` | P1 |
+| 12 | Email | IMAP 轮询 + SMTP 发信 | 标准库 | `EMAIL_ADDRESS` `EMAIL_PASSWORD` `EMAIL_IMAP_HOST` `EMAIL_SMTP_HOST` `EMAIL_AUTHSERV_ID` | **P0** |
 | 13 | ntfy | HTTP 流式订阅 + POST 发布 | httpx | `NTFY_TOPIC` `NTFY_SERVER_URL` `NTFY_TOKEN` | P1 |
 | 14 | Google Chat（Pub/Sub 拉取模式） | Cloud Pub/Sub pull 收事件、REST 发消息 | `google-cloud-pubsub` 2.43.0 | `GOOGLE_CHAT_SERVICE_ACCOUNT_JSON` `GOOGLE_CHAT_PROJECT_ID` `GOOGLE_CHAT_SUBSCRIPTION_NAME` | P1 |
 

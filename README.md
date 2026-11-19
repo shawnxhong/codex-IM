@@ -7,7 +7,7 @@
 - **两种模型认证**：ChatGPT 账号登录（device code），以及自定义 API key（任意兼容 Responses API 的端点）。两者可以同时启用，按会话切换。
 - **隔离部署**：在 Ubuntu 上用 Docker 运行，与宿主机上已有的 codex / hermes 完全隔离。IM 凭证和执行代码的 agent 放在不同的容器里。
 
-> **状态：设计阶段**，还没有实现代码。设计结论见 `docs/`。
+> **状态：设计阶段**，还没有实现代码。设计结论见 `docs/`。首批（P0）平台：飞书、Telegram、微信（个人号）、Email。
 
 ## 文档
 

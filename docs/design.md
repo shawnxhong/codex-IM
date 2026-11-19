@@ -83,7 +83,9 @@ codex-IM 只做一件事：**把 IM 消息接到 Codex 上，自身只是一层"
 
 ### D6. 会话模型
 
-- **会话键**：`(platform, chat_id, thread_or_topic_id)`。群聊默认整个群共用一个会话，也可以配置成按用户拆分。
+- **会话键**：`(platform, chat_id, thread_or_topic_id)`。
+- **群聊整个群共用一个会话**（已确定，不提供按用户拆分）。群里任何一个白名单用户都可以发消息、`/new`、`/stop`。为了让 Codex 分得清是谁在说话，群聊里每条输入前加上发送者标识（如 `[昵称]: …`）；私聊不加。
+- **Email** 没有"群"的概念：一个邮件线程（按 `In-Reply-To`/`References` 串起来）对应一个会话，一封新邮件就是一个新会话。
 - **持久化**：`会话键 → codex thread_id`，存在 bridge 的 SQLite 里。thread_id 在 turn 完成后才写入。
 - **重启续接**：用 `thread_resume`。续接失败时新开 thread，并只在该会话里提示一次（沿用 Hermes 的做法）。**不从本地记录重建上下文**：Codex 的 thread 才是真正的上下文，本地只存映射和少量元数据。
 - **工作目录**：默认每个会话一个独立目录 `/workspace/<platform>/<chat>`；可以在配置里把某个会话绑定到某个项目目录。
@@ -110,13 +112,14 @@ codex-IM 只做一件事：**把 IM 消息接到 Codex 上，自身只是一层"
 - 沿用 Hermes 总结的规则：
   - 流式过程中的草稿必须"前缀稳定"：后一帧以前一帧为前缀，不在中途改写已发出的内容；
   - 最终结果**通过编辑原消息落定**，不另发一条，否则会出现重复的最终消息。
-- **长输出**：按平台的单条长度上限分段；超过阈值（可配置）就改为发送文件。
+- **长输出**：按平台的单条长度上限分段发送。**不往 IM 发送文件附件**：Codex 生成的文件留在工作区，不回传（已确定）。
 - **工具进度**：可选择显示一行精简状态（例如"运行中：pytest …"），详细程度可配置，默认精简。
 - Markdown 按平台转换（Slack mrkdwn、Telegram MarkdownV2/HTML、飞书富文本或卡片、纯文本平台去掉格式）。
 
 ### D9. 安全模型
 
 - **准入**：每个平台一个白名单 `<PLATFORM>_ALLOWED_USERS`，**默认拒绝**。`<PLATFORM>_ALLOW_ALL_USERS` 只用于开发。群聊里必须 @ 机器人才会响应。
+- **Email 的发件人可以伪造**：白名单不能只看 `From`，必须校验收件服务器加上的 `Authentication-Results` 头（DMARC/DKIM/SPF 为 pass，且 authserv-id 等于 `EMAIL_AUTHSERV_ID`），校验不过一律丢弃（沿用 Hermes 的做法）。自动邮件（`Auto-Submitted`、`Precedence: bulk/list/junk`、`List-Unsubscribe` 等）也要丢弃，防止和自动回复互相触发形成循环。
 - **非白名单内容**：默认丢弃；可选把群聊上下文以 `ExternalMessage` 的形式提供给模型（低权限，不代表用户授权）。
 - **出网白名单**：
   - agent 容器只接入 `internal` 网络，所有出网都经过一个域名白名单代理；
@@ -183,11 +186,11 @@ codex-IM 只做一件事：**把 IM 消息接到 Codex 上，自身只是一层"
 
 | 组件 | 职责 |
 |---|---|
-| `platforms/<name>` | 只做协议转换：平台事件 → `InboundMessage`；`send`/`edit`/`send_file`/`typing`；声明自身能力 |
+| `platforms/<name>` | 只做协议转换：平台事件 → `InboundMessage`；`send`/`edit`/`typing`；声明自身能力 |
 | `core/router` | 计算会话键、准入检查、群聊 @ 判定、命令分流 |
 | `core/sessions` | 会话 ↔ thread 映射、每会话的锁和队列、steer/interrupt、持久化 |
 | `codex/runtime` | 封装 `AsyncCodex`：thread 生命周期、turn 流、provider/model 参数、错误分类 |
-| `core/render` | 流式节流、前缀稳定草稿、分段、Markdown 方言转换、长输出转文件 |
+| `core/render` | 流式节流、前缀稳定草稿、分段、Markdown 方言转换 |
 | `ingress` | webhook 平台共用的 HTTP 服务（验签由各平台实现） |
 
 ### 适配器接口（草案）
@@ -199,7 +202,6 @@ class Capabilities:
     max_text_len: int
     markup: Literal["markdown", "slack_mrkdwn", "telegram_html", "feishu_post", "plain", ...]
     supports_threads: bool
-    supports_files: bool
     supports_images_in: bool
 
 @dataclass(frozen=True)
@@ -221,7 +223,6 @@ class PlatformAdapter(Protocol):
     async def stop(self) -> None: ...
     async def send(self, chat: ChatRef, text: str, *, reply_to: str | None = None) -> MessageRef: ...
     async def edit(self, ref: MessageRef, text: str) -> None: ...          # 仅 can_edit
-    async def send_file(self, chat: ChatRef, path: Path, caption: str | None = None) -> MessageRef: ...
     async def typing(self, chat: ChatRef) -> None: ...
 ```
 
@@ -246,10 +247,15 @@ class PlatformAdapter(Protocol):
 8. 日志里不出现用户内容。
 9. 两个实例不要共用同一份 Codex `auth.json`：refresh token 会轮换，两边互相覆盖后会掉线。
 
-## 5. 待决问题
+## 5. 已确定事项（2026-11-19）
 
-- P0 的首批参考平台（建议飞书和 Telegram：一个国内、一个海外，都支持编辑消息流式）。
-- 群聊会话是整个群共用，还是按用户拆分（目前默认整群共用）。
-- 出站文件投递：agent 生成的文件如何发回 IM？候选方案是 bridge 提供一个 opt-in 的 `send_file` MCP 工具，但这会引入少量 harness，需要权衡。
+- **P0 平台**：飞书、Telegram、微信（个人号）、Email。
+- **群聊**：整个群共用一个会话。
+- **出站文件**：不往 IM 回传 Codex 生成的文件，也不做 `send_file` 工具。
+- **代码托管**：GitHub `shawnxhong/codex-IM`。
+
+## 6. 待决问题
+
 - 语音消息（STT 和 TTS）是否需要。
 - 是否提供 `api_server` 之类的非 IM 入口（Hermes 内置，但不在 `plugins/platforms` 中）。
+- 许可证。
