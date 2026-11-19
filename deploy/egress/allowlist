@@ -1,0 +1,11 @@
+# Domains the agent container may reach (squid dstdomain; a leading dot includes subdomains).
+# VERIFY(ubuntu): V0 — observe what ChatGPT login mode actually needs, then prune this list.
+.openai.com
+.chatgpt.com
+# Custom provider host (custom API key mode), e.g.:
+# gateway.example.com
+# Package indexes / code hosting the agent may need for its work:
+.pypi.org
+.pythonhosted.org
+.github.com
+.githubusercontent.com

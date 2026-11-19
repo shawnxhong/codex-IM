@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codex-im"
+version = "0.1.0"
+description = "Thin bridge connecting IM platforms to OpenAI Codex through the openai-codex SDK"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  # The exact version is pinned at image build time (CODEX_VERSION); see deploy/docker/Dockerfile.
+  "openai-codex",
+  "python-telegram-bot>=22.0,<23",
+  "aiohttp>=3.10,<4",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6"]
+
+[project.scripts]
+codex-im = "codex_im.app:cli"
+codex-im-agentd = "codex_im.agentd.__main__:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_im"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC"]
+ignore = ["E501"]

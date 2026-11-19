@@ -1,0 +1,13 @@
+# Overlay for automated acceptance scenarios with the fake platform (docs/verification.md).
+#   docker compose -f deploy/compose.yaml -f deploy/compose.fake.yaml up -d
+# Control API on the host: http://127.0.0.1:8787  (POST /inbound, GET /outbound, POST /control, POST /reset)
+services:
+  bridge:
+    ports: ["127.0.0.1:8787:8787"]
+    environment:
+      CODEX_IM_PLATFORMS: fake
+      FAKE_HOST: 0.0.0.0
+      FAKE_PORT: "8787"
+      FAKE_ALLOW_ALL_USERS: "true"
+      # Set per scenario, e.g. CODEX_IM_FAULTS: crash_after_turn_start
+      CODEX_IM_FAULTS: ${CODEX_IM_FAULTS:-}

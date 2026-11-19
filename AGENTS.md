@@ -30,15 +30,19 @@
 - 凭证环境变量名和 Hermes 保持一致（D11），并在 `docs/platforms.md` 中登记。
 - 新增或修改平台时，逐条满足 `docs/platforms.md` 末尾的验收清单。
 
-## 目录约定（计划）
+## 目录约定
 
 ```
 src/codex_im/
-  core/        router / sessions / commands / render / store
-  codex/       runtime（AsyncCodex 封装）
-  platforms/   <name>/adapter.py
-  ingress/     webhook 平台共享的 HTTP 服务
+  core/        store / router / sessions / commands / render / outbox / finalize / recovery / workspace / admission
+  codex/       runtime（AsyncCodex 封装，唯一和 Codex 通信的地方）/ events / errors
+  platforms/   base.py + <name>/adapter.py（email 平台的包名是 mail，避免和标准库重名）
+  agentd/      agent 容器里的工作区服务，只能用标准库
+  ingress/     webhook 平台共享的 HTTP 服务（P2）
 deploy/        Dockerfile、compose、egress 白名单、secrets 样例
-tests/
+tests/         fakes.py 里的 FakeRuntime 模拟 Codex；端到端测试使用 fake 平台
 docs/
 ```
+
+- 新增平台时，在 `platforms/__init__.py` 的 `build_adapters` 里注册。
+- `agentd` 和 `agent_config` 只能 import 标准库：agent 镜像用 `--no-deps` 安装本包。

@@ -31,3 +31,7 @@ auth.json
 *.swp
 .DS_Store
 Thumbs.db
+
+# Local deployment config (examples are committed)
+deploy/config/*.yaml
+deploy/docker/ca/*.crt

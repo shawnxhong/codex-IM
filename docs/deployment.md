@@ -1,6 +1,6 @@
 # 部署：Ubuntu + Docker
 
-> 状态：设计草案。下面的 compose 片段是示意，不是最终文件；最终文件在 P0 实现时放到 `deploy/` 目录。
+> 状态：实际文件在 `deploy/` 目录（`compose.yaml`、`compose.fake.yaml`、`docker/Dockerfile`、`egress/`、`secrets/*.example`），常用命令见根目录的 `Makefile`。下面的片段用于说明设计，以 `deploy/` 中的文件为准。这些文件都还没有在 Ubuntu 上运行过。
 
 ## 1. 宿主机要求
 
@@ -97,9 +97,9 @@ services:
 
 - **agent 端**：
   ```
-  socat TCP-LISTEN:4500,reuseaddr,fork,range=<bridge 子网> EXEC:"codex app-server --listen stdio://"
+  socat TCP-LISTEN:4500,reuseaddr,fork EXEC:/usr/local/bin/codex-app-server
   ```
-  每个连接启动一个 app-server。bridge 必须保证同一时间只有一条连接，避免多个 app-server 同时写同一个 `CODEX_HOME`。
+  `codex-app-server` 是一个包装脚本，内容是 `exec codex app-server --listen stdio://`；这样 socat 的 EXEC 参数里就不会出现冒号和空格。每个连接启动一个 app-server。bridge 必须保证同一时间只有一条连接，避免多个 app-server 同时写同一个 `CODEX_HOME`。
 - **bridge 端**：
   ```python
   CodexConfig(launch_args_override=("socat", "-", "TCP:agent:4500"))

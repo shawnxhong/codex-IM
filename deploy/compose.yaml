@@ -1,0 +1,80 @@
+# codex-IM on Ubuntu (design D4, D5, docs/deployment.md).
+#   cp deploy/.env.example deploy/.env            # CODEX_VERSION
+#   for f in deploy/secrets/*.env.example; do cp "$f" "${f%.example}"; done; chmod 600 deploy/secrets/*.env
+#   docker compose -f deploy/compose.yaml build
+name: codex-im
+
+x-hardening: &hardening
+  restart: unless-stopped
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+
+services:
+  agent:
+    <<: *hardening
+    image: codex-im-agent:${CODEX_VERSION:?set CODEX_VERSION in deploy/.env}
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+      target: agent
+      args: { CODEX_VERSION: "${CODEX_VERSION}" }
+    networks: [agent_internal]
+    volumes:
+      - codex-home:/home/agent/.codex
+      - workspace:/workspace
+    env_file: [./secrets/shared.env, ./secrets/agent.env]
+    environment:
+      HTTPS_PROXY: http://egress-proxy:3128
+      HTTP_PROXY: http://egress-proxy:3128
+      https_proxy: http://egress-proxy:3128
+      http_proxy: http://egress-proxy:3128
+      NO_PROXY: localhost,127.0.0.1
+      no_proxy: localhost,127.0.0.1
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 2
+
+  bridge:
+    <<: *hardening
+    image: codex-im-bridge:${CODEX_VERSION:?set CODEX_VERSION in deploy/.env}
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+      target: bridge
+      args: { CODEX_VERSION: "${CODEX_VERSION}" }
+    networks: [im, agent_internal]
+    volumes:
+      - bridge-data:/data
+      - ./config:/config:ro
+    env_file: [./secrets/shared.env, ./secrets/bridge.env]
+    environment:
+      CODEX_IM_APP_SERVER: tcp://agent:4500
+      CODEX_IM_AGENTD: tcp://agent:4501
+      CODEX_IM_DATA_DIR: /data
+    depends_on: [agent]
+
+  egress-proxy:
+    # Not hardened like the others: squid needs to drop privileges itself.
+    image: ubuntu/squid:latest
+    restart: unless-stopped
+    networks: [agent_internal, egress]
+    volumes:
+      - ./egress/squid.conf:/etc/squid/squid.conf:ro
+      - ./egress/allowlist:/etc/squid/allowlist:ro
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+networks:
+  im: {}
+  egress: {}
+  agent_internal:
+    internal: true # no direct internet: the agent can only leave through egress-proxy (D9)
+
+volumes:
+  codex-home: {}
+  workspace: {}
+  bridge-data: {}

@@ -1,0 +1,11 @@
+# Optional: projects and session -> project bindings (design D6).
+# Copy to deploy/config/codex-im.yaml and set CODEX_IM_CONFIG_FILE=/config/codex-im.yaml in bridge.env.
+# Paths are paths inside the agent container (under /workspace).
+projects:
+  myrepo:
+    path: /workspace/projects/myrepo
+    concurrency: serial # serial: project-wide lock (default) | worktree: one git worktree per session
+
+bindings:
+  - session: { platform: telegram, chat_id: "-1001234567890", topic: "*" } # every topic of this group
+    project: myrepo

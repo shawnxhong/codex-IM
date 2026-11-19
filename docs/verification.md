@@ -16,6 +16,35 @@ Windows 本机只写代码和文档，**不运行任何东西**。构建、测�
   - `fail_delivery_permanent`：投递返回永久失败。
 - **冒烟测试** `python -m codex_im.smoke`：依次做初始化、新建 thread、执行一个只读 turn、resume 这个 thread。
 
+## 如何执行
+
+**单元测试和端到端测试**（Codex 是模拟的，不需要网络和登录）：
+
+```bash
+make test
+```
+
+`tests/test_sessions.py` 和 `tests/test_recovery.py` 用模拟的 Codex 覆盖了下面各场景的**逻辑**：V1 的 async 提问、V2-1、V3 的 a/b/e、V4-1、V5-1、V6、V7。真实的 Codex 和平台行为仍然要按下面的场景在 Ubuntu 上实测。
+
+**接真实 Codex 的 fake 平台**：
+
+```bash
+make up-fake                                    # bridge 只启用 fake 平台；控制 API 在 127.0.0.1:8787
+curl -s -XPOST localhost:8787/inbound -H 'content-type: application/json'      -d '{"chat_id":"c1","user_id":"u1","text":"列出当前目录的文件"}'
+curl -s localhost:8787/outbound | python3 -m json.tool
+curl -s -XPOST localhost:8787/control -d '{"can_edit": false}'      # 模拟不能编辑消息的平台
+curl -s -XPOST localhost:8787/control -d '{"fail_next": 3}'         # 后面 3 次投递失败
+```
+
+**故障注入**：启动时设置 `CODEX_IM_FAULTS`，例如：
+
+```bash
+CODEX_IM_FAULTS=crash_after_turn_start make up-fake
+```
+
+- bridge 在注入点以退出码 77 退出，compose 的 `restart: unless-stopped` 会把它重新拉起，然后走恢复流程。
+- 每个注入点在同一个 data 卷里只触发一次，避免反复崩溃。要再次触发，先删掉标记：`docker compose -f deploy/compose.yaml exec bridge rm -rf /data/faults-fired`。
+
 ## 场景
 
 ### V0. 环境与中继（D4、D5）

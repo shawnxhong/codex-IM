@@ -7,7 +7,44 @@
 - **两种模型认证**：ChatGPT 账号登录（device code），以及自定义 API key（任意兼容 Responses API 的端点）。两者可以同时启用，按会话切换。
 - **隔离部署**：在 Ubuntu 上用 Docker 运行，与宿主机上已有的 codex / hermes 完全隔离。IM 凭证和执行代码的 agent 放在不同的容器里。
 
-> **状态：设计阶段**，还没有实现代码。设计结论见 `docs/`。首批平台：P0a 是 Telegram 和 Email，P0b 是飞书和微信（个人号）。开发在 Windows 上进行，运行和测试都在 Ubuntu 上。
+> **状态：P0a 代码已写完，尚未在 Ubuntu 上运行过。** 包括核心模块、Docker 部署、Telegram、Email，以及用于自动化验收的 fake 平台。
+> 开发机（Windows）上不运行任何东西，所以目前所有测试和验收场景**都还没有执行**。依赖未验证行为的代码处标有 `VERIFY(ubuntu)`，在 Ubuntu 上按 [docs/verification.md](docs/verification.md) 逐项确认。
+> 首批平台：P0a 是 Telegram 和 Email；P0b 是飞书和微信（个人号）。
+
+## 在 Ubuntu 上运行
+
+前提：Docker Engine（官方 apt 源）和 compose v2 插件。宿主机上不需要 Python，也不需要 codex。
+
+```bash
+git clone https://github.com/shawnxhong/codex-IM.git && cd codex-IM
+cp deploy/.env.example deploy/.env                     # CODEX_VERSION
+for f in deploy/secrets/*.env.example; do cp "$f" "${f%.example}"; done
+chmod 600 deploy/secrets/*.env                         # 然后按注释填写 shared / agent / bridge 三个文件
+
+make test                                              # 在测试镜像里跑单元测试
+make build
+make login                                             # 仅 ChatGPT 模式需要：device code 登录，只做一次
+make smoke                                             # 冒烟测试：经过真实中继走一遍 Codex
+make up && make logs
+```
+
+用 fake 平台跑验收场景：`make up-fake`，然后通过 `http://127.0.0.1:8787` 注入消息、查看输出（详见 docs/verification.md）。
+
+## 代码结构
+
+```
+src/codex_im/
+  app.py              bridge 进程的组装和启动（python -m codex_im）
+  config.py           CODEX_IM_* 配置
+  codex/              runtime（AsyncCodex 封装）、events（版本无关的事件解析）、errors（错误分类）
+  core/               store（SQLite）、router、sessions（状态机）、commands、render、outbox、finalize、recovery、workspace、admission
+  platforms/          base（适配器接口）、telegram、mail（email 平台）、fake
+  agentd/             agent 容器里的工作区服务（标准库实现）
+  agent_config.py     agent 容器启动时生成 config.toml
+  smoke.py            冒烟测试
+deploy/               Dockerfile（bridge / agent / test 三个 target）、compose、egress 白名单、secrets 和配置样例
+tests/                单元测试和端到端测试（fake 平台 + 模拟的 Codex）
+```
 
 ## 文档
 
