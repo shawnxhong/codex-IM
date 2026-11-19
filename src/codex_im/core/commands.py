@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .types import InboundMessage
@@ -10,10 +11,10 @@ if TYPE_CHECKING:
     from .sessions import SessionManager, SessionRuntime
 
 COMMANDS = frozenset(
-    {"new", "stop", "status", "sessions", "resume", "retry", "model", "provider", "compact", "help", "start"}
+    {"new", "stop", "status", "sessions", "resume", "retry", "model", "provider", "compact", "release", "help", "start"}
 )
 
-HELP_TEXT = """可用命令：
+HELP_TEXT = """可用命令（群聊里请 @ 机器人，或使用 /命令@机器人名）：
 /new — 开始新会话（旧会话进入历史）
 /stop — 停止当前任务
 /status — 查看状态
@@ -23,11 +24,19 @@ HELP_TEXT = """可用命令：
 /model [名称] — 查看或切换 model
 /provider [id] — 查看或切换 provider（会重置上下文）
 /compact — 压缩当前上下文
+/release — （管理员）强制释放无法确认结束的任务
 /help — 显示本帮助"""
 
 
-def parse_command(text: str, bot_username: str | None = None) -> tuple[str, str] | None:
-    """``/name[@bot] args`` -> (name, args). Unknown commands are treated as normal text (e.g. paths)."""
+@dataclass(frozen=True, slots=True)
+class Command:
+    name: str
+    args: str
+    addressed: bool  # written as /name@<this bot>: explicitly directed at us (group rule, D9)
+
+
+def parse_command(text: str, bot_username: str | None = None) -> Command | None:
+    """``/name[@bot] args`` -> Command. Unknown names are normal text (e.g. paths like /etc/hosts)."""
     stripped = text.strip()
     if not stripped.startswith("/") or len(stripped) < 2:
         return None
@@ -36,26 +45,32 @@ def parse_command(text: str, bot_username: str | None = None) -> tuple[str, str]
         head, _, extra = head.partition("\n")
         rest = (extra + " " + rest).strip()
     name = head[1:]
+    addressed = False
     if "@" in name:
         name, _, target = name.partition("@")
-        if bot_username and target.lower() != bot_username.lower():
+        if not bot_username or target.lower() != bot_username.lower():
             return None
+        addressed = True
     name = name.lower()
     if name not in COMMANDS:
         return None
-    return name, rest.strip()
+    return Command(name, rest.strip(), addressed)
+
+
+_STOP_REPLIES = {
+    "idle": "当前没有运行中的任务。",
+    "already": "正在停止中…",
+    "cancelled_queue": "已取消排队中的消息。",
+    "unresolved": "上一个任务还在等待 Codex 确认结束，已再次尝试中断。确认 Codex 已不在运行时，管理员可以用 /release 强制释放。",
+    # "stopped": the turn's own final message says "已停止"; "abandoned": the abandon notice says it all.
+}
 
 
 async def execute(mgr: SessionManager, rt: SessionRuntime, msg: InboundMessage, name: str, args: str) -> str | None:
     if name in ("help", "start"):
         return HELP_TEXT
     if name == "stop":
-        result = await mgr.request_stop(rt)
-        return {
-            "idle": "当前没有运行中的任务。",
-            "already": "正在停止中…",
-            "cancelled_queue": "已取消排队中的消息。",
-        }.get(result)  # "stopped": the turn's own final message says "已停止"
+        return _STOP_REPLIES.get(await mgr.request_stop(rt))
     if name == "new":
         result = await mgr.request_new(rt)
         if result == "stopped_and_new":
@@ -69,6 +84,8 @@ async def execute(mgr: SessionManager, rt: SessionRuntime, msg: InboundMessage, 
         return await mgr.resume(rt, args)
     if name == "retry":
         return await mgr.retry(rt)
+    if name == "release":
+        return await mgr.release(rt, msg)
     if name == "model":
         return await mgr.set_model(rt, args)
     if name == "provider":

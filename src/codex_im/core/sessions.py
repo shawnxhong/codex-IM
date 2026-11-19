@@ -3,11 +3,17 @@
 State machine per session::
 
     idle --turn()--> running --completed/failed--> idle
-                       |--/stop--> stopping --turn ends or timeout--> idle
+                       |--/stop--> stopping --turn ends, or deadline -> abandoned--> idle
                        '--/new --> stopping --> switch current thread --> idle
 
-State changes are serialized by ``SessionRuntime.lock`` (held only briefly). Commands run on a separate
-per-session queue, so they are never stuck behind a long turn.
+Invariants (review 2026-11-19-p0a):
+- R1  steer intent is persisted before the RPC; only a provable refusal returns input to the queue.
+- R2  state-changing commands raise a control barrier *when received*; the worker neither starts turns nor
+      steers while a barrier is up, so later messages never reach the old thread.
+- R3  "local consumer stopped" is not "remote turn ended": a turn holds its cwd until its remote outcome
+      is confirmed (WorkspaceHolds, released only by the Finalizer).
+- R4  /stop and /new run under one deadline that includes the interrupt RPC; no network await ever runs
+      while holding ``SessionRuntime.lock``; read-only commands bypass the command queue.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from ..logutil import h
 from ..platforms.base import PlatformAdapter
 from .admission import Admission
 from .finalize import Finalizer
+from .holds import Reservation, WorkspaceHolds
 from .outbox import Outbox
 from .render import StreamRenderer
 from .store import Store
@@ -43,16 +50,26 @@ log = logging.getLogger(__name__)
 IDLE, RUNNING, STOPPING = "idle", "running", "stopping"
 STATE_LABELS = {IDLE: "空闲", RUNNING: "运行中", STOPPING: "停止中"}
 
+# Commands that change execution state: they raise the control barrier as soon as they are received.
+BARRIER_COMMANDS = frozenset({"stop", "new", "resume", "provider", "retry", "compact", "model", "release"})
+# Commands that only read state: executed immediately, never queued behind a slow /stop.
+READ_ONLY_COMMANDS = frozenset({"status", "sessions", "help", "start"})
+
 TEXT_RATE_LIMITED = "⚠️ 消息太频繁，这条没有执行，请稍后再发。"
 TEXT_CONTEXT_LOST = (
     "⚠️ 之前的上下文已经无法恢复（Codex 中找不到这个会话）。这条消息没有执行。\n"
     "请发 /new 开始新会话，或用 /sessions 和 /resume 切换到其他会话，然后重新发送。"
 )
 TEXT_UNAVAILABLE = "⚠️ Codex 暂时不可用，消息已保留，恢复后会自动处理。"
-TEXT_PROJECT_BUSY = "⏳ 项目 {project} 正被另一个会话使用，已排队。"
+TEXT_PROJECT_BUSY = "⏳ 工作目录（{project}）正被另一个任务使用，已排队。"
+TEXT_HOLD_SELF = "⏳ 上一个任务还没有确认结束（Codex 端可能仍在运行），这条消息已排队；可以发 /stop 再次尝试停止。"
 TEXT_CANCELLED = "已取消，这条消息没有执行。"
 TEXT_REJECTED = "❌ Codex 拒绝了请求：{error}\n消息没有执行（可以用 /model 或 /provider 调整后重新发送）。"
 TEXT_WORKSPACE_FAILED = "❌ 工作目录准备失败：{error}\n消息没有执行。"
+TEXT_ABANDONED = (
+    "⚠️ 停止超时：已不再等待这个任务，但 Codex 端可能仍在运行。工作目录会保持占用，直到确认它结束"
+    "（会继续尝试中断）。确认 Codex 已不在运行时，管理员可以用 /release 强制释放。"
+)
 
 
 class ContextLost(Exception):
@@ -82,16 +99,16 @@ class SessionRuntime:
     key: SessionKey
     key_str: str
     state: str = IDLE
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # short critical sections only, never across I/O
     idle: asyncio.Event = field(default_factory=asyncio.Event)
     work: asyncio.Event = field(default_factory=asyncio.Event)
     commands: asyncio.Queue[tuple[int, InboundMessage, str, str]] = field(default_factory=asyncio.Queue)
+    controls_pending: int = 0  # R2 barrier: received but not yet finished state-changing commands
     handle: Any = None
     turn_id: int | None = None
     thread_id: str | None = None
     current: asyncio.Task[None] | None = None
     stop_requested: bool = False
-    switch_pending: bool = False
     abandoned: bool = False
     unavailable_notified: bool = False
     retry_delay: float = 0.0
@@ -105,6 +122,7 @@ class SessionManager:
         store: Store,
         runtime: Any,
         workspace: Workspace,
+        holds: WorkspaceHolds,
         adapters: Mapping[str, PlatformAdapter],
         outbox: Outbox,
         finalizer: Finalizer,
@@ -116,6 +134,7 @@ class SessionManager:
         self.store = store
         self.runtime = runtime
         self.workspace = workspace
+        self.holds = holds
         self.adapters = adapters
         self.outbox = outbox
         self.finalizer = finalizer
@@ -153,6 +172,13 @@ class SessionManager:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    def _deadline(self, seconds: float) -> float:
+        return asyncio.get_running_loop().time() + seconds
+
+    @staticmethod
+    def _left(deadline: float) -> float:
+        return deadline - asyncio.get_running_loop().time()
+
     # ------------------------------------------------------------------ inbound
     async def on_message(self, key_str: str) -> None:
         rt = self.runtime_for(key_str)
@@ -161,44 +187,83 @@ class SessionManager:
         rt.work.set()
 
     def submit_command(self, key_str: str, inbound_id: int, msg: InboundMessage, name: str, args: str) -> None:
-        self.runtime_for(key_str).commands.put_nowait((inbound_id, msg, name, args))
+        """Called synchronously by the router, in arrival order, before later messages are recorded."""
+        rt = self.runtime_for(key_str)
+        if name in READ_ONLY_COMMANDS:
+            spawn(self._run_command(rt, inbound_id, msg, name, args, barrier=False), name=f"cmd-{name}")
+            return
+        if name in BARRIER_COMMANDS:
+            rt.controls_pending += 1  # R2: effective immediately, not when the command worker gets to it
+        rt.commands.put_nowait((inbound_id, msg, name, args))
 
     async def _try_steer(self, rt: SessionRuntime) -> bool:
+        """Append queued input to the running turn. Returns True when the input was taken care of."""
         async with rt.lock:
-            if rt.state != RUNNING or rt.handle is None or rt.switch_pending or rt.stop_requested:
+            if (
+                rt.state != RUNNING
+                or rt.handle is None
+                or rt.turn_id is None
+                or rt.controls_pending
+                or rt.stop_requested
+            ):
                 return False
             rows = self.store.queued_messages(rt.key_str)
             if not rows:
                 return True
             text = self.compose_input(rows)
-            try:
-                await rt.handle.steer(text)
-            except Exception as exc:
-                # VERIFY(ubuntu): V1 — error returned when the turn already finished; message stays queued.
-                log.info("steer failed (%s); message stays queued", type(exc).__name__)
-                return False
-            self.store.set_inbound_state([int(r["id"]) for r in rows], "steered", rt.turn_id)
-            if rt.thread_id:
-                self.store.close_open_questions(rt.thread_id)
-            log.info("steered %d message(s) into the running turn of %s", len(rows), h(rt.key_str))
+            ids = [int(r["id"]) for r in rows]
+            handle, turn_id, thread_id = rt.handle, rt.turn_id, rt.thread_id
+            steer_id = self.store.begin_steer(turn_id, text, ids)  # R1: intent first; rows leave the queue
+        self.faults.hit("crash_after_steer_persist")
+        try:
+            await asyncio.wait_for(handle.steer(text), self.settings.rpc_timeout)  # outside the lock (R4)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            kind = classify(exc)
+            if kind in (ErrorKind.REJECTED, ErrorKind.NOT_FOUND):
+                # A JSON-RPC refusal proves the input was not taken: it may run as the next turn.
+                # VERIFY(ubuntu): V1 — error returned when steering a turn that just finished.
+                self.store.reject_steer(steer_id)
+                log.info("steer refused (%s); input returns to the queue", type(exc).__name__)
+                rt.work.set()
+                return True
+            # Timeout / transport loss: Codex may have taken it. Never replay; resolve from history later.
+            self.store.mark_steer_unknown(steer_id)
+            log.warning("steer outcome unknown (%s: %s); not replaying", kind.value, type(exc).__name__)
             return True
+        self.faults.hit("crash_after_steer_send")
+        self.store.accept_steer(steer_id)
+        if thread_id:
+            self.store.close_open_questions(thread_id)
+        log.info("steered %d message(s) into turn %d of %s", len(ids), turn_id, h(rt.key_str))
+        return True
 
     async def _command_worker(self, rt: SessionRuntime) -> None:
-        from .commands import execute
-
         while True:
             inbound_id, msg, name, args = await rt.commands.get()
-            try:
-                reply = await execute(self, rt, msg, name, args)
-                if reply:
-                    self.outbox.notice(rt.key_str, msg.chat, reply, reply_to=msg.reply_to)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("command /%s failed", name)
-                self.outbox.notice(rt.key_str, msg.chat, f"❌ 命令 /{name} 执行失败", reply_to=msg.reply_to)
-            finally:
-                self.store.set_inbound_state([inbound_id], "done")
+            await self._run_command(rt, inbound_id, msg, name, args, barrier=name in BARRIER_COMMANDS)
+
+    async def _run_command(
+        self, rt: SessionRuntime, inbound_id: int, msg: InboundMessage, name: str, args: str, *, barrier: bool
+    ) -> None:
+        from .commands import execute
+
+        try:
+            reply = await execute(self, rt, msg, name, args)
+            if reply:
+                self.outbox.notice(rt.key_str, msg.chat, reply, reply_to=msg.reply_to)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("command /%s failed", name)
+            self.outbox.notice(rt.key_str, msg.chat, f"❌ 命令 /{name} 执行失败", reply_to=msg.reply_to)
+        finally:
+            self.store.set_inbound_state([inbound_id], "done")
+            if barrier:
+                rt.controls_pending = max(0, rt.controls_pending - 1)
+                if rt.controls_pending == 0:
+                    rt.work.set()
 
     # ------------------------------------------------------------------ worker
     async def _worker(self, rt: SessionRuntime) -> None:
@@ -207,7 +272,7 @@ class SessionManager:
             rt.work.clear()
             while not self._closing:
                 async with rt.lock:
-                    if rt.switch_pending or rt.state != IDLE:
+                    if rt.controls_pending or rt.state != IDLE:
                         break
                     rows = self.store.queued_messages(rt.key_str)
                     if not rows:
@@ -283,7 +348,8 @@ class SessionManager:
             return
 
         turn_created = False
-        acquired_lock: asyncio.Lock | None = None
+        token: Reservation | None = None
+        cwd = ""
         try:
             try:
                 thread = await self._ensure_thread(rt, session, rows)
@@ -309,25 +375,17 @@ class SessionManager:
             rt.unavailable_notified = False
             rt.retry_delay = 0.0
             rt.thread_id = str(thread["thread_id"])
+            cwd = str(thread["cwd"])
 
-            lock = self.workspace.project_lock(session["project"])
-            if lock is not None:
-                if lock.locked():
-                    self.outbox.notice(
-                        key_str, chat, TEXT_PROJECT_BUSY.format(project=session["project"]), reply_to=reply_to
-                    )
-                if not await self._acquire_unless_stopped(rt, lock):
-                    self.store.set_inbound_state(ids, "ignored")
-                    self.outbox.notice(key_str, chat, TEXT_CANCELLED, reply_to=reply_to)
-                    return
-                acquired_lock = lock
-            if rt.stop_requested:
+            token = await self._wait_hold(rt, session, cwd, chat, reply_to)
+            if token is None or rt.stop_requested:
                 self.store.set_inbound_state(ids, "ignored")
                 self.outbox.notice(key_str, chat, TEXT_CANCELLED, reply_to=reply_to)
                 return
 
             text = self.compose_input(rows)
-            turn_id = self.store.create_turn(key_str, rt.thread_id, text, ids, reply_to)
+            turn_id = self.store.create_turn(key_str, rt.thread_id, text, ids, reply_to, cwd=cwd)
+            self.holds.bind(cwd, token, turn_id)  # from now on only the Finalizer releases it
             turn_created = True
             rt.turn_id = turn_id
             self.faults.hit("crash_after_turn_pending")
@@ -338,22 +396,21 @@ class SessionManager:
                 self.store.set_inbound_state(ids, "ignored")
             raise
         finally:
-            if acquired_lock is not None:
-                acquired_lock.release()
+            if token is not None and not turn_created:
+                self.holds.cancel(cwd, token)
 
-    async def _acquire_unless_stopped(self, rt: SessionRuntime, lock: asyncio.Lock) -> bool:
-        acquire = asyncio.ensure_future(lock.acquire())
-        while True:
-            done, _ = await asyncio.wait({acquire}, timeout=0.5)
-            if done:
-                return True
-            if rt.stop_requested:
-                acquire.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await acquire
-                if not acquire.cancelled():
-                    lock.release()  # acquired just before the cancel took effect
-                return False
+    async def _wait_hold(
+        self, rt: SessionRuntime, session: sqlite3.Row, cwd: str, chat: ChatRef, reply_to: str | None
+    ) -> Reservation | None:
+        owner = self.holds.owner(cwd)
+        if owner is not None:
+            same_session = False
+            if isinstance(owner, int):
+                held = self.store.get_turn(owner)
+                same_session = held is not None and held["session_key"] == rt.key_str
+            text = TEXT_HOLD_SELF if same_session else TEXT_PROJECT_BUSY.format(project=session["project"] or cwd)
+            self.outbox.notice(rt.key_str, chat, text, reply_to=reply_to)
+        return await self.holds.acquire(cwd, lambda: rt.stop_requested or self._closing)
 
     async def _ensure_thread(self, rt: SessionRuntime, session: sqlite3.Row, rows: list[sqlite3.Row]) -> sqlite3.Row:
         key_str = rt.key_str
@@ -386,9 +443,11 @@ class SessionManager:
                         raise ContextLost() from exc
 
         try:
-            cwd = await self.workspace.cwd_for_new_thread(rt.key, session["project"])
-        except AgentdUnreachable as exc:
-            raise CodexUnavailable(f"agentd: {exc}") from exc
+            cwd = await asyncio.wait_for(
+                self.workspace.cwd_for_new_thread(rt.key, session["project"]), self.settings.rpc_timeout
+            )
+        except (AgentdUnreachable, asyncio.TimeoutError) as exc:
+            raise CodexUnavailable(f"agentd: {exc or type(exc).__name__}") from exc
         except AgentdError as exc:
             raise WorkspaceFailed(str(exc)) from exc
         try:
@@ -404,6 +463,10 @@ class SessionManager:
         trow = self.store.get_thread(new_id)
         assert trow is not None
         return trow
+
+    def _to_reconcile(self, turn_id: int, error: str | None = None, *, interrupt: bool = False) -> None:
+        self.store.set_turn_state(turn_id, "abandoned" if interrupt else "reconciling", error)
+        self.recovery.schedule(turn_id, delay=1.0, interrupt=interrupt)
 
     async def _execute_turn(
         self,
@@ -432,11 +495,10 @@ class SessionManager:
                 if kind is ErrorKind.REJECTED:
                     self.finalizer.finalize(turn_id, status="failed", error=short_message(exc))
                     return
-                # We cannot tell whether Codex received the turn: reconcile from thread history (D14).
+                # Timeout or transport loss: Codex may have started it. Reconcile from history (D14).
                 if kind is ErrorKind.TRANSIENT:
                     await self.runtime.reset()
-                self.store.set_turn_state(turn_id, "reconciling", short_message(exc))
-                self.recovery.schedule(turn_id)
+                self._to_reconcile(turn_id, short_message(exc))
                 return
             self.store.set_turn_started(turn_id, str(handle.id))
             self.faults.hit("crash_after_turn_start")
@@ -444,14 +506,21 @@ class SessionManager:
                 rt.handle = handle
                 stop_now = rt.stop_requested
             if stop_now:
-                await self._interrupt(handle)
+                await self._interrupt_until(handle, self._deadline(self.settings.rpc_timeout))
             await self._consume(rt, handle, renderer, turn_id, str(thread["thread_id"]), chat)
         except asyncio.CancelledError:
             if rt.abandoned:
                 row = self.store.get_turn(turn_id)
                 if row is not None and row["state"] in ("pending", "started"):
-                    self.finalizer.finalize(turn_id, status="abandoned")
+                    # R3: the local consumer is gone, the remote turn may still run: keep the hold.
+                    self._to_reconcile(turn_id, "stop timeout", interrupt=True)
+                    self.outbox.notice(rt.key_str, chat, TEXT_ABANDONED)
             raise
+        except Exception:
+            log.exception("turn %d failed unexpectedly; reconciling from history", turn_id)
+            row = self.store.get_turn(turn_id)
+            if row is not None and row["state"] in ("pending", "started"):
+                self._to_reconcile(turn_id, "internal error")
         finally:
             await renderer.close()
 
@@ -467,7 +536,7 @@ class SessionManager:
         items: list[dict[str, Any]] = []
         status: str | None = None
         error: str | None = None
-        seq = 0
+        questions = 0
         handle_id = str(handle.id)
         stream = handle.stream()
         try:
@@ -485,11 +554,13 @@ class SessionManager:
                         continue
                     item_id = str(item.get("id") or "")
                     if is_async_message(item):
-                        # D13: non-blocking clarification — deliver on its own, never via final_response.
-                        seq += 1
+                        # D13: non-blocking clarification — delivered on its own, never via final_response.
+                        questions += 1
                         renderer.drop(item_id)
                         self.store.add_open_question(thread_id, turn_id, item_id)
-                        self.outbox.async_question(rt.key_str, chat, turn_id, seq, "❓ " + format_questions(item))
+                        self.outbox.async_question(
+                            rt.key_str, chat, turn_id, questions, "❓ " + format_questions(item)
+                        )
                     else:
                         items.append(item)
                         renderer.on_agent_message(item_id, str(item.get("text") or ""))
@@ -511,8 +582,7 @@ class SessionManager:
             log.warning("turn stream for %s broke (%s: %s)", h(rt.key_str), kind.value, type(exc).__name__)
             if kind is ErrorKind.TRANSIENT:
                 await self.runtime.reset()
-            self.store.set_turn_state(turn_id, "reconciling", short_message(exc))
-            self.recovery.schedule(turn_id)
+            self._to_reconcile(turn_id, short_message(exc))
             return
         finally:
             with contextlib.suppress(Exception):
@@ -520,28 +590,36 @@ class SessionManager:
 
         final = pick_final_text(items)
         if status in ("completed", "interrupted", "failed"):
-            self.finalizer.finalize(turn_id, status=status, final_text=final, error=error)
+            self.finalizer.finalize(turn_id, status=status, final_text=final, error=error, has_questions=questions > 0)
         else:
             log.warning("turn stream ended without a terminal status (%r); reconciling", status)
-            self.store.set_turn_state(turn_id, "reconciling")
-            self.recovery.schedule(turn_id)
+            self._to_reconcile(turn_id)
 
-    @staticmethod
-    async def _interrupt(handle: Any) -> None:
+    # ------------------------------------------------------------------ stop / new (D15, R4)
+    async def _interrupt_until(self, handle: Any, deadline: float) -> None:
+        remaining = self._left(deadline)
+        if remaining <= 0:
+            return
         try:
-            await handle.interrupt()
+            await asyncio.wait_for(handle.interrupt(), remaining)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            log.info("interrupt failed (%s)", type(exc).__name__)
+            log.info("interrupt did not complete (%s)", type(exc).__name__)
 
-    # ------------------------------------------------------------------ commands (D7, D15)
-    async def _wait_idle_or_abandon(self, rt: SessionRuntime) -> bool:
-        """Wait for the running turn to end. Returns False if it had to be abandoned."""
+    async def _wait_idle_until(self, rt: SessionRuntime, deadline: float) -> bool:
+        remaining = self._left(deadline)
+        if remaining <= 0:
+            return rt.idle.is_set()
         try:
-            await asyncio.wait_for(rt.idle.wait(), self.settings.stop_timeout)
+            await asyncio.wait_for(rt.idle.wait(), remaining)
             return True
         except asyncio.TimeoutError:
-            pass
-        log.warning("stop timeout for %s; abandoning the turn", h(rt.key_str))
+            return False
+
+    async def _abandon(self, rt: SessionRuntime) -> None:
+        """Stop waiting for the local consumer. The remote turn keeps its hold (R3)."""
+        log.warning("stop deadline exceeded for %s; abandoning the local consumer", h(rt.key_str))
         rt.abandoned = True
         task = rt.current
         if task is not None and not task.done():
@@ -549,56 +627,70 @@ class SessionManager:
             await asyncio.wait({task}, timeout=5)
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(rt.idle.wait(), 5)
-        return False
+
+    def _close_questions(self, rt: SessionRuntime) -> None:
+        thread_id = rt.thread_id
+        if thread_id is None:
+            session = self.store.get_session(rt.key_str)
+            thread_id = session["active_thread_id"] if session is not None else None
+        if thread_id:
+            self.store.close_open_questions(thread_id)
+
+    async def _stop_running(self, rt: SessionRuntime, deadline: float) -> str:
+        """Common part of /stop and /new for a running turn: interrupt, wait, abandon at the deadline."""
+        async with rt.lock:
+            handle = rt.handle
+        if handle is not None:
+            await self._interrupt_until(handle, deadline)
+        if await self._wait_idle_until(rt, deadline):
+            return "stopped"
+        await self._abandon(rt)
+        return "abandoned"
 
     async def request_stop(self, rt: SessionRuntime) -> str:
-        handle = None
+        deadline = self._deadline(self.settings.stop_timeout)
         async with rt.lock:
             if rt.state == STOPPING:
                 return "already"
             if rt.state == IDLE:
+                self._close_questions(rt)
                 rows = self.store.queued_messages(rt.key_str)
                 if rows:
                     self.store.set_inbound_state([int(r["id"]) for r in rows], "ignored")
                     return "cancelled_queue"
+                unresolved = self.store.unfinished_turns(rt.key_str)
+                if unresolved:
+                    for row in unresolved:
+                        self.recovery.schedule(int(row["id"]), delay=0.1, interrupt=True)
+                    return "unresolved"
                 return "idle"
             rt.stop_requested = True
             rt.state = STOPPING
-            handle = rt.handle
-        if handle is not None:
-            await self._interrupt(handle)
-        await self._wait_idle_or_abandon(rt)
-        return "stopped"
+        self._close_questions(rt)
+        return await self._stop_running(rt, deadline)
 
     async def request_new(self, rt: SessionRuntime) -> str:
-        handle = None
+        deadline = self._deadline(self.settings.stop_timeout)
         async with rt.lock:
-            rt.switch_pending = True
             was_running = rt.state in (RUNNING, STOPPING)
             if rt.state == RUNNING:
                 rt.stop_requested = True
                 rt.state = STOPPING
-                handle = rt.handle
-        try:
-            if handle is not None:
-                await self._interrupt(handle)
-            if was_running:
-                await self._wait_idle_or_abandon(rt)
-            async with rt.lock:
-                self.store.set_active_thread(rt.key_str, None)
-                rt.thread_id = None
-        finally:
-            async with rt.lock:
-                rt.switch_pending = False
-            rt.work.set()
+        self._close_questions(rt)
+        if was_running:
+            await self._stop_running(rt, deadline)
+        async with rt.lock:
+            self.store.set_active_thread(rt.key_str, None)
+            rt.thread_id = None
         return "stopped_and_new" if was_running else "new"
 
+    # ------------------------------------------------------------------ other commands (D7)
     def _threads_for(self, rt: SessionRuntime, limit: int = 10) -> list[sqlite3.Row]:
         return self.store.list_threads(rt.key_str, limit=limit)
 
     async def resume(self, rt: SessionRuntime, ref: str) -> str:
         async with rt.lock:
-            if rt.state != IDLE or rt.switch_pending:
+            if rt.state != IDLE:
                 return "当前有任务在运行，请先发 /stop。"
             target = self._resolve_thread(rt, ref)
             if target is None:
@@ -626,7 +718,7 @@ class SessionManager:
 
     async def retry(self, rt: SessionRuntime) -> str:
         async with rt.lock:
-            if rt.state != IDLE or rt.switch_pending:
+            if rt.state != IDLE:
                 return "当前有任务在运行，请先发 /stop。"
             turn = self.store.last_retryable_turn(rt.key_str)
             if turn is None:
@@ -645,8 +737,22 @@ class SessionManager:
             )
             self.store.insert_inbound(msg, kind="message", composed=True)
             self.store.set_turn_state(int(turn["id"]), "retried")
-        rt.work.set()
         return "🔁 正在重新执行上一个任务。"
+
+    async def release(self, rt: SessionRuntime, msg: InboundMessage) -> str:
+        """Escape hatch for a turn whose remote end can never be confirmed (R3). Admin only."""
+        if not self.admission.is_admin(msg.platform, msg.user_id):
+            return "你没有执行 /release 的权限。"
+        async with rt.lock:
+            if rt.state != IDLE:
+                return "当前有任务在运行，请先发 /stop。"
+            rows = self.store.unfinished_turns(rt.key_str)
+        if not rows:
+            return "没有需要释放的任务。"
+        for row in rows:
+            log.warning("turn %d force-released by %s", int(row["id"]), h(msg.user_id))
+            self.finalizer.finalize(int(row["id"]), status="released")
+        return f"已强制释放 {len(rows)} 个未确认结束的任务。"
 
     async def set_model(self, rt: SessionRuntime, slug: str) -> str:
         session = self.store.get_session(rt.key_str)
@@ -668,10 +774,10 @@ class SessionManager:
             return f"当前 provider：{session['provider']}（可选：{allowed}）"
         if provider not in self.settings.allowed_providers:
             return f"不允许的 provider：{provider}"
-        if not self.admission.is_provider_admin(msg.platform, msg.user_id):
+        if not self.admission.is_admin(msg.platform, msg.user_id):
             return "你没有切换 provider 的权限。"
         async with rt.lock:
-            if rt.state != IDLE or rt.switch_pending:
+            if rt.state != IDLE:
                 return "当前有任务在运行，请先发 /stop。"
             if provider == session["provider"]:
                 return f"已经在使用 {provider}。"
@@ -681,21 +787,19 @@ class SessionManager:
         return f"provider 已切换为 {provider}。上下文已重置（provider 绑定在会话上，旧会话可用 /sessions 找回）。"
 
     async def compact(self, rt: SessionRuntime) -> str:
-        async with rt.lock:
-            if rt.state != IDLE or rt.switch_pending:
+        async with rt.lock:  # check only; the RPC below runs outside the lock (R4), guarded by the barrier
+            if rt.state != IDLE:
                 return "当前有任务在运行，请稍后再试。"
             session = self.store.get_session(rt.key_str)
             thread_id = session["active_thread_id"] if session is not None else None
             trow = self.store.get_thread(thread_id) if thread_id else None
-            if session is None or trow is None:
-                return "当前没有会话可以压缩。"
-            try:
-                await self.runtime.load_thread(
-                    thread_id, cwd=trow["cwd"], model=session["model"], provider=trow["provider"]
-                )
-                await self.runtime.compact(thread_id)
-            except Exception as exc:
-                return f"压缩失败：{short_message(exc)}"
+        if session is None or trow is None or not thread_id:
+            return "当前没有会话可以压缩。"
+        try:
+            await self.runtime.load_thread(thread_id, cwd=trow["cwd"], model=session["model"], provider=trow["provider"])
+            await self.runtime.compact(thread_id)
+        except Exception as exc:
+            return f"压缩失败：{short_message(exc)}"
         return "已请求 Codex 压缩上下文。"
 
     def status_text(self, rt: SessionRuntime) -> str:
@@ -706,6 +810,7 @@ class SessionManager:
         trow = self.store.get_thread(thread_id) if thread_id else None
         queued = len(self.store.queued_messages(rt.key_str))
         open_q = self.store.open_question_count(thread_id) if thread_id else 0
+        unresolved = len(self.store.unfinished_turns(rt.key_str)) if rt.state == IDLE else 0
         cwd = trow["cwd"] if trow is not None else "（下一条消息时创建）"
         lines = [
             f"状态：{STATE_LABELS.get(rt.state, rt.state)}",
@@ -717,6 +822,8 @@ class SessionManager:
             f"排队消息：{queued}",
             f"待回答的问题：{open_q}",
         ]
+        if unresolved:
+            lines.append(f"等待 Codex 确认结束的任务：{unresolved}")
         return "\n".join(lines)
 
     def sessions_text(self, rt: SessionRuntime) -> str:

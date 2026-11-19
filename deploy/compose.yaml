@@ -36,6 +36,18 @@ services:
     pids_limit: 512
     mem_limit: 4g
     cpus: 2
+    # Review R9: the agent's only way out is egress-proxy, so it must be up first — also for one-off
+    # `docker compose run agent ...` (make login) and `run bridge ...` (make smoke), which start dependencies.
+    depends_on:
+      egress-proxy:
+        condition: service_healthy
+    healthcheck:
+      # agentd answers on 4501 (port 4500 would spawn an app-server per connection, so it is not probed).
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 4501), 2).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
 
   bridge:
     <<: *hardening
@@ -54,7 +66,9 @@ services:
       CODEX_IM_APP_SERVER: tcp://agent:4500
       CODEX_IM_AGENTD: tcp://agent:4501
       CODEX_IM_DATA_DIR: /data
-    depends_on: [agent]
+    depends_on:
+      agent:
+        condition: service_healthy
 
   egress-proxy:
     # Not hardened like the others: squid needs to drop privileges itself.
@@ -64,6 +78,13 @@ services:
     volumes:
       - ./egress/squid.conf:/etc/squid/squid.conf:ro
       - ./egress/allowlist:/etc/squid/allowlist:ro
+    healthcheck:
+      # VERIFY(ubuntu): V0 — `squid -k check` works in the ubuntu/squid image.
+      test: ["CMD", "squid", "-k", "check"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
     logging:
       driver: json-file
       options: { max-size: "20m", max-file: "5" }

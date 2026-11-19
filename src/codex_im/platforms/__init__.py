@@ -20,7 +20,7 @@ def build_adapters(settings: Settings, store: Any) -> dict[str, PlatformAdapter]
         elif name == "email":
             from .mail.adapter import EmailAdapter
 
-            adapters[name] = EmailAdapter(data_dir=settings.data_dir)
+            adapters[name] = EmailAdapter(data_dir=settings.data_dir, store=store)
         elif name == "fake":
             from .fake.adapter import FakeAdapter
 

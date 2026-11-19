@@ -51,6 +51,7 @@ def make_settings(tmp_path: Path) -> Callable[..., Settings]:
             "workspace_root": str(tmp_path / "ws"),
             "stream_interval": 0.05,
             "stop_timeout": 2.0,
+            "rpc_timeout": 2.0,
             "rate_limit_per_min": 0,
         }
         values.update(overrides)

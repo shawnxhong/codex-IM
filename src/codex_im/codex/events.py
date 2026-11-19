@@ -73,16 +73,36 @@ def pick_final_text(items: list[dict[str, Any]]) -> str | None:
     return fallback
 
 
-def user_text_of_turn(turn: dict[str, Any]) -> str:
-    """Concatenated text of the userMessage items of a history turn."""
-    parts: list[str] = []
+def user_texts_of_turn(turn: dict[str, Any]) -> list[str]:
+    """Text of each userMessage item of a history turn, in order: the turn's input first, then steers.
+
+    VERIFY(ubuntu): V1/V3 — steered input appears in the history turn as its own userMessage item.
+    """
+    texts: list[str] = []
     for item in turn.get("items") or []:
         if not isinstance(item, dict) or item.get("type") != "userMessage":
             continue
-        for content in item.get("content") or []:
-            if isinstance(content, dict) and content.get("type") == "text":
-                parts.append(str(content.get("text") or ""))
-    return "\n".join(parts)
+        parts = [
+            str(content.get("text") or "")
+            for content in item.get("content") or []
+            if isinstance(content, dict) and content.get("type") == "text"
+        ]
+        texts.append("\n".join(parts))
+    return texts
+
+
+def user_text_of_turn(turn: dict[str, Any]) -> str:
+    """The input that started a history turn (its first userMessage item)."""
+    texts = user_texts_of_turn(turn)
+    return texts[0] if texts else ""
+
+
+def started_at_of_turn(turn: dict[str, Any]) -> float | None:
+    value = turn.get("startedAt")
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def agent_items_of_turn(turn: dict[str, Any]) -> list[dict[str, Any]]:

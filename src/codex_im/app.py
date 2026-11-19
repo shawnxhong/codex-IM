@@ -15,6 +15,7 @@ from .codex.runtime import CodexRuntime
 from .config import Settings, SettingsError, load_settings
 from .core.admission import Admission
 from .core.finalize import Finalizer
+from .core.holds import WorkspaceHolds
 from .core.outbox import Outbox
 from .core.recovery import Recovery
 from .core.router import Router
@@ -40,6 +41,7 @@ class Bridge:
     sessions: SessionManager
     router: Router
     recovery: Recovery
+    holds: WorkspaceHolds
 
 
 def build(settings: Settings, *, runtime: Any = None, adapters: dict[str, PlatformAdapter] | None = None) -> Bridge:
@@ -51,13 +53,15 @@ def build(settings: Settings, *, runtime: Any = None, adapters: dict[str, Platfo
     adapters = adapters if adapters is not None else build_adapters(settings, store)
     outbox = Outbox(store, adapters, faults)
     runtime = runtime if runtime is not None else CodexRuntime(settings)
-    finalizer = Finalizer(store, outbox, adapters)
-    recovery = Recovery(store, runtime, finalizer)
-    admission = Admission(provider_admins=settings.provider_admins)
+    holds = WorkspaceHolds()
+    finalizer = Finalizer(store, outbox, adapters, holds)
+    recovery = Recovery(store, runtime, finalizer, outbox)
+    admission = Admission(admins=settings.admins)
     sessions = SessionManager(
         store=store,
         runtime=runtime,
         workspace=workspace,
+        holds=holds,
         adapters=adapters,
         outbox=outbox,
         finalizer=finalizer,
@@ -75,11 +79,15 @@ def build(settings: Settings, *, runtime: Any = None, adapters: dict[str, Platfo
         faults=faults,
         adapters=adapters,
     )
-    return Bridge(settings, store, adapters, outbox, runtime, sessions, router, recovery)
+    return Bridge(settings, store, adapters, outbox, runtime, sessions, router, recovery, holds)
 
 
 async def start(bridge: Bridge) -> None:
     spawn(bridge.outbox.run(), name="outbox")
+    # R3: restore workspace holds of unresolved turns *before* anything queued may run.
+    held = bridge.holds.restore(bridge.store.unfinished_turns())
+    if held:
+        log.info("restored %d workspace hold(s) of unresolved turns", held)
     bridge.recovery.run_startup()
     bridge.sessions.kick_all_queued()
     for name, adapter in bridge.adapters.items():

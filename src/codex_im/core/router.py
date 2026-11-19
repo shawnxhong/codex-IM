@@ -49,7 +49,9 @@ class Router:
             return True
         adapter = self._adapters.get(msg.platform)
         command = parse_command(msg.text, adapter.bot_username if adapter is not None else None)
-        if msg.is_group and not msg.mentions_bot and command is None:
+        # D9 / review R12: in groups everything, commands included, must be directed at this bot
+        # (an @mention, a reply to the bot, or /command@this_bot).
+        if msg.is_group and not msg.mentions_bot and not (command is not None and command.addressed):
             return True
         key = msg.chat.session_key
         key_str = key.encode()
@@ -69,12 +71,12 @@ class Router:
             "inbound %s on %s (%s, %d chars) for session %s",
             h(msg.message_key),
             msg.platform,
-            f"/{command[0]}" if command else "message",
+            f"/{command.name}" if command else "message",
             len(msg.text),
             h(key_str),
         )
         if command is not None:
-            self._sessions.submit_command(key_str, row_id, msg, command[0], command[1])
+            self._sessions.submit_command(key_str, row_id, msg, command.name, command.args)
         else:
             spawn(self._sessions.on_message(key_str), name=f"on-message-{h(key_str)}")
         return True

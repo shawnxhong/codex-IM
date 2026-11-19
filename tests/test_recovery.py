@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from conftest import wait_for
 from fakes import FakeRuntime
 
@@ -24,11 +26,13 @@ def _seed(settings, *, codex_turn_id: str | None, input_text: str = "do it") -> 
     return key, turn_id
 
 
-def _history(status: str, final: str | None, text: str = "do it", turn_id: str = "turn-x") -> dict:
+def _history(
+    status: str, final: str | None, text: str = "do it", turn_id: str = "turn-x", started: float | None = None
+) -> dict:
     items = [{"type": "userMessage", "content": [{"type": "text", "text": text}]}]
     if final:
         items.append({"type": "agentMessage", "id": "m", "text": final, "phase": "final_answer"})
-    return {"id": turn_id, "status": status, "items": items}
+    return {"id": turn_id, "status": status, "startedAt": int(started or time.time()), "items": items}
 
 
 async def test_completed_turn_is_delivered_from_history(harness_factory, make_settings):

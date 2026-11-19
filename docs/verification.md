@@ -12,6 +12,8 @@ Windows 本机只写代码和文档，**不运行任何东西**。构建、测�
   - `crash_after_turn_pending`：`turns` 写入 pending 之后、调用 `turn()` 之前退出；
   - `crash_after_turn_start`：拿到 `codex_turn_id` 之后退出；
   - `crash_before_outbox_send`：结果已写入 outbox、还没投递时退出；
+  - `crash_after_steer_persist`：追加意图已持久化、steer RPC 发出之前退出；
+  - `crash_after_steer_send`：steer RPC 已成功、本地还没标记为 steered 时退出；
   - `fail_delivery:<n>`：前 n 次投递返回临时失败；
   - `fail_delivery_permanent`：投递返回永久失败。
 - **冒烟测试** `python -m codex_im.smoke`：依次做初始化、新建 thread、执行一个只读 turn、resume 这个 thread。
@@ -102,7 +104,13 @@ CODEX_IM_FAULTS=crash_after_turn_start make up-fake
    - 旧 turn 迟到的事件不会出现在新 thread 的输出里。
 2. 连发两次 `/stop`。**期望**：幂等，不报错。
 3. 在 running 状态下发 `/resume`。**期望**：被拒绝，并提示先发 `/stop`。
-4. 用一个不响应中断的命令（比如 `sleep 600`）触发 stopping 超时。**期望**：turn 标记为 unknown，强制切换，并告诉用户。
+4. 用一个不响应中断的命令（比如 `sleep 600`）触发停止截止时间。**期望**：
+   - 在 `CODEX_IM_STOP_TIMEOUT` 内给出"停止超时"的通知（即使 interrupt RPC 本身不返回）；turn 标为 abandoned；
+   - `/status` 仍然立即响应，并显示"等待 Codex 确认结束的任务"；
+   - 同一会话的新消息、`/new` 之后的新 thread、以及绑定同一 serial 项目的其他会话，都**不会开始执行**，并收到"已排队"的提示；
+   - 远端 turn 真正结束后（或者管理员 `/release` 之后），排队的消息才开始执行；
+   - 记录：在真实 Codex 上，对放弃的 turn 用 turn id 再发 interrupt 是否生效；中继断开后历史里这个 turn 的状态（V3b）。
+5. 依次快速发送 `/stop`、`/new`、普通消息，并让旧 turn 在 `/stop` 等待期间才结束。**期望**：普通消息只在新 thread 中执行，旧 thread 没有收到它（评审 R2）。
 
 ### V6. 同一项目的并发（D6）
 
@@ -121,6 +129,24 @@ CODEX_IM_FAULTS=crash_after_turn_start make up-fake
 1. 伪造白名单地址作为 `From`，并且没有通过 `Authentication-Results` 校验。**期望**：丢弃，记一条日志（不含邮件内容）。
 2. 发一封带 `Auto-Submitted: auto-replied` 头的邮件。**期望**：丢弃。
 3. 回复邮件。**期望**：带有正确的 `In-Reply-To` / `References`，落在同一个会话里。
+
+### V10. 评审 2026-11-19-p0a 的回归（R1–R12）
+
+`tests/test_review_p0a.py` 用模拟 Codex 覆盖了每一项的逻辑。在 Ubuntu 上还要用真实 Codex 确认下面几项依赖真实行为的地方：
+
+| 项 | 在真实环境中确认 |
+|---|---|
+| R1 | 对刚结束的 turn 调用 steer，返回的是 JSON-RPC 错误（会被当成"拒绝"），而不是断线或超时；追加的输入在历史里以独立的 userMessage 出现。用 `crash_after_steer_persist` 和 `crash_after_steer_send` 各重启一次：两种情况都**不会**把那条消息当成新 turn 执行 |
+| R3 | 见 V5-4 |
+| R4 | 见 V5-4；另外断开 agent 网络让 steer 卡住，`/stop` 仍然在截止时间内返回 |
+| R5 | 用 `{"fail_next": 1}` 让第一条分段失败，确认后面的分段不会先到 |
+| R6 | 用 `crash_after_turn_pending` 制造一次"无 ID 恢复"，然后发送完全相同的内容并再次崩溃：第二次不会收到第一次的结果。另外确认 `startedAt` 存在且单位是秒 |
+| R7 | 一个只提问、没有最终回答的 turn 在提问后崩溃：重启后问题被补发一次 |
+| R8 | 用真实邮件客户端往返三次以上，并且只回复机器人的邮件：始终在同一个会话里 |
+| R9 | 在没有任何 codex-im 容器的机器上，严格按 README 的首次安装顺序执行 `make login`、`make smoke` |
+| R10 | 发一个会产生超长提问或超长通知的任务：Telegram 收到分段，没有 dead 记录 |
+| R11 | 提问之后 `/stop`：`/status` 显示待回答的问题为 0 |
+| R12 | 群里发裸 `/stop` 没有效果；`/stop@机器人名` 生效 |
 
 ### V9. 升级回归（D12）
 

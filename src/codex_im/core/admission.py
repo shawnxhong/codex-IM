@@ -13,9 +13,9 @@ def _norm(value: str) -> str:
 
 
 class Admission:
-    def __init__(self, env: Mapping[str, str] | None = None, provider_admins: set[str] | None = None) -> None:
+    def __init__(self, env: Mapping[str, str] | None = None, admins: set[str] | None = None) -> None:
         self._env = os.environ if env is None else env
-        self._provider_admins = {_norm(v) for v in (provider_admins or set())}
+        self._admins = {_norm(v) for v in (admins or set())}
 
     def allow_all(self, platform: str) -> bool:
         return truthy(self._env.get(f"{platform.upper()}_ALLOW_ALL_USERS"))
@@ -26,7 +26,8 @@ class Admission:
         allowed = {_norm(v) for v in split_csv(self._env.get(f"{platform.upper()}_ALLOWED_USERS"))}
         return _norm(user_id) in allowed
 
-    def is_provider_admin(self, platform: str, user_id: str) -> bool:
-        if not self._provider_admins:
+    def is_admin(self, platform: str, user_id: str) -> bool:
+        """Admins may use /provider and /release. Empty list = every allowlisted user."""
+        if not self._admins:
             return True
-        return f"{_norm(platform)}:{_norm(user_id)}" in self._provider_admins
+        return f"{_norm(platform)}:{_norm(user_id)}" in self._admins

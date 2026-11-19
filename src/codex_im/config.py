@@ -43,7 +43,7 @@ class Settings:
     platforms: list[str] = field(default_factory=list)
     default_provider: str = "openai"
     allowed_providers: list[str] = field(default_factory=list)
-    provider_admins: set[str] = field(default_factory=set)
+    admins: set[str] = field(default_factory=set)  # platform:user ids allowed /provider and /release
     developer_instructions: str | None = None
     app_server: str = "local"  # "local" (spawn bundled codex) or tcp://host:port (stdio-over-TCP relay, D5)
     agentd: str = "local"  # "local" (in-process) or tcp://host:port (agent container, D5)
@@ -52,7 +52,8 @@ class Settings:
     config_file: str | None = None
     stream_interval: float = 1.5
     busy_policy: str = "steer"  # steer | queue (D6)
-    stop_timeout: float = 30.0
+    stop_timeout: float = 30.0  # deadline for the whole /stop or /new flow, interrupt RPC included (R4)
+    rpc_timeout: float = 60.0  # upper bound for any single Codex / agentd request
     rate_limit_per_min: int = 10
     faults: str = ""
     log_level: str = "INFO"
@@ -92,6 +93,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     try:
         stream_interval = float(env.get("CODEX_IM_STREAM_INTERVAL") or 1.5)
         stop_timeout = float(env.get("CODEX_IM_STOP_TIMEOUT") or 30)
+        rpc_timeout = float(env.get("CODEX_IM_RPC_TIMEOUT") or 60)
         rate = int(env.get("CODEX_IM_RATE_LIMIT_PER_MIN") or 10)
     except ValueError as exc:
         raise SettingsError(f"invalid numeric setting: {exc}") from exc
@@ -101,7 +103,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         platforms=platforms,
         default_provider=default_provider,
         allowed_providers=allowed,
-        provider_admins={p.lower() for p in split_csv(env.get("CODEX_IM_PROVIDER_ADMINS"))},
+        admins={p.lower() for p in split_csv(env.get("CODEX_IM_ADMINS") or env.get("CODEX_IM_PROVIDER_ADMINS"))},
         developer_instructions=(env.get("CODEX_IM_DEVELOPER_INSTRUCTIONS") or "").strip() or None,
         app_server=app_server,
         agentd=agentd,
@@ -111,6 +113,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         stream_interval=max(0.05, stream_interval),
         busy_policy=busy,
         stop_timeout=max(1.0, stop_timeout),
+        rpc_timeout=max(1.0, rpc_timeout),
         rate_limit_per_min=max(0, rate),
         faults=env.get("CODEX_IM_FAULTS") or "",
         log_level=(env.get("CODEX_IM_LOG_LEVEL") or "INFO").upper(),

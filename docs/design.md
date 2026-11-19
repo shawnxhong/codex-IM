@@ -97,10 +97,16 @@ codex-IM 只做一件事：**把 IM 消息接到 Codex 上，自身只是一层"
   - 默认目录包含**完整的会话标识**：`/workspace/sessions/<platform>/<chat>/<topic 或 _>`。每一段都做安全转义，过长时改用哈希。所以同一个 Telegram 群的两个 topic 是两个会话，各自有独立的目录。
   - cwd 记在 thread 上：`/resume` 回到旧 thread 时，使用它当时的 cwd。
   - **绑定项目**：配置 `projects.<name>.path`，并配置"会话 → 项目"的绑定关系。多个会话绑定同一个项目时，按项目的 `concurrency` 设置处理：
-    - `serial`（默认）：**项目级锁**。同一时刻这个项目里只运行一个 turn，其他会话的 turn 排队，并收到提示"项目 X 正被另一个会话使用，已排队"。只给每个会话加锁解决不了这个问题。
+    - `serial`（默认）：所有绑定的会话共用项目路径。同一时刻这个项目里只运行一个 turn，其他会话的 turn 排队，并收到提示"工作目录正被另一个任务使用，已排队"。
     - `worktree`：每个会话一个独立的 git worktree，位于 `/workspace/worktrees/<project>/<session>`，分支名为 `codex-im/<session 短 ID>`。这种模式下可以并行，但只适用于 git 仓库；是否合并回主分支由用户决定。
   - 目录和 worktree 都由 `agentd` 创建（D5）。
-- **并发**：每个会话同时最多一个活动 turn。turn 进行中收到的新消息默认用 `steer()` 追加到当前 turn（可配置为排队）。不同会话之间并行，但受项目锁的约束。状态机和命令竞态见 D15。
+- **工作目录占用**（评审 R3）：互斥的单位是 **cwd**，不是会话或项目。turn 在 `turn/start` 之前占用自己的 cwd，**直到它的远端结果被确认为终态才释放**：
+  - 释放只发生在 Finalizer 里，也就是 turn 变成 completed / interrupted / failed / unknown / released 的那一刻；
+  - "本地不再消费"（停止超时、断线、bridge 重启）不等于"远端已经结束"，这些情况下占用会一直保持，直到对账确认远端结束；
+  - 一个 cwd 同时覆盖三种情况：`serial` 项目跨会话串行；同一会话在旧 turn 未确认结束时不能开新 turn（包括 `/new` 之后的新 thread，因为它们共用会话目录）；`worktree` 项目每个会话的路径不同，可以并行；
+  - 重启时，先从数据库恢复所有未确认 turn 的占用，再派发排队的消息；
+  - 逃生口：确认 Codex 端确实不再运行之后，管理员可以用 `/release` 强制把这些 turn 标记为 released 并释放占用（D7）。
+- **并发**：每个会话同时最多一个活动 turn。turn 进行中收到的新消息默认用 `steer()` 追加到当前 turn（可配置为排队），追加的规则见 D14。不同会话之间并行，但受 cwd 占用的约束。状态机和命令竞态见 D15。
 - **provider 和 model**：provider 在 thread 创建时就固定了，`/provider` 切换会新开一个 thread；model 可以每个 turn 单独指定，`/model` 从下一个 turn 开始生效。
 
 ### D7. 桥接命令（由 bridge 处理，不发给 Codex）
@@ -116,9 +122,14 @@ codex-IM 只做一件事：**把 IM 消息接到 Codex 上，自身只是一层"
 | `/model <slug>` | 切换 model（下一个 turn 生效） | ✓ |
 | `/provider <id>` | 切换 provider（新开 thread） | |
 | `/compact` | 让 Codex 压缩当前 thread | |
+| `/release` | （管理员）把本会话中远端结果无法确认的 turn 标记为 released，释放 cwd 占用（D6） | （需要先空闲） |
 | `/help` | 命令列表 | ✓ |
 
-- 标"运行中可用"的命令**必须绕过会话排队，直接执行**。这一点 Hermes 踩过坑：审批或停止命令被排在正在运行的 turn 后面，结果失效。
+- **命令分两类**（评审 R2、R4）：
+  - **只读命令**（`/status`、`/sessions`、`/help`）收到后立即执行，不进入命令队列，所以不会被一个正在等待的 `/stop` 卡住。
+  - **改变执行状态的命令**（`/stop`、`/new`、`/resume`、`/provider`、`/retry`、`/compact`、`/model`、`/release`）在**收到时**就竖起该会话的"控制屏障"，然后按到达顺序在命令队列里逐个执行。屏障存在期间，worker 不开始新 turn，也不做 steer；最后一个控制命令执行完才放下屏障。因此排在它们之后的普通消息不会落到旧 thread 上。
+- 这一点 Hermes 也踩过坑：停止命令被排在正在运行的 turn 后面，结果失效。
+- **群聊里命令也必须明确指向本机器人**（评审 R12）：@ 机器人、回复机器人的消息，或者写成 `/命令@机器人名`。裸的 `/stop` 在群里会被忽略。
 - **`/sessions` 和 `/resume` 的可见范围**：只能看到和恢复**当前会话键**下记录过的 thread，数据来自 bridge 自己的库。不使用 Codex 的 `thread_list`，因为它会返回所有会话的 thread。私聊只能看到自己的，群聊里是整个群共享的历史，和 D6 一致。给的 ID 不属于当前会话时，统一回复"不存在"，不泄露这个 ID 是否在别处存在。
 
 ### D8. 输出投递
@@ -134,7 +145,7 @@ codex-IM 只做一件事：**把 IM 消息接到 Codex 上，自身只是一层"
 
 ### D9. 安全模型
 
-- **准入**：每个平台一个白名单 `<PLATFORM>_ALLOWED_USERS`，**默认拒绝**。`<PLATFORM>_ALLOW_ALL_USERS` 只用于开发。群聊里必须 @ 机器人才会响应。
+- **准入**：每个平台一个白名单 `<PLATFORM>_ALLOWED_USERS`，**默认拒绝**。`<PLATFORM>_ALLOW_ALL_USERS` 只用于开发。群聊里必须 @ 机器人才会响应，命令也一样（D7）。
 - **Email 的发件人可以伪造**：白名单不能只看 `From`，必须校验收件服务器加上的 `Authentication-Results` 头（DMARC/DKIM/SPF 为 pass，且 authserv-id 等于 `EMAIL_AUTHSERV_ID`），校验不过一律丢弃（沿用 Hermes 的做法）。自动邮件（`Auto-Submitted`、`Precedence: bulk/list/junk`、`List-Unsubscribe` 等）也要丢弃，防止和自动回复互相触发形成循环。
 - **非白名单内容**：默认丢弃；可选把群聊上下文以 `ExternalMessage` 的形式提供给模型（低权限，不代表用户授权）。
 - **出网白名单**：
@@ -210,10 +221,11 @@ codex-IM 只做一件事：**把 IM 消息接到 Codex 上，自身只是一层"
 
 | 表 | 关键字段 | 作用 |
 |---|---|---|
-| `inbound` | `(platform, message_key)` 唯一、`session_key`、`state`（received / queued / dispatched / steered / ignored）、`turn_id` | 入站去重和排队。`message_key` 取平台的消息 ID：Telegram 的 `update_id`、飞书的 `message_id`、微信的消息 ID、Email 的 `Message-ID` |
+| `inbound` | `(platform, message_key)` 唯一、`session_key`、`state`（queued / dispatched / steering / steered / steer_unknown / done / ignored）、`turn_id` | 入站去重和排队。只有 `queued` 会被自动执行。`message_key` 取平台的消息 ID：Telegram 的 `update_id`、飞书的 `message_id`、微信的消息 ID、Email 的 `Message-ID` |
 | `threads` | `thread_id`、`session_key`、`state`（created / materialized / lost）、`cwd`、`provider`、`title`、`turn_count` | `thread_start` 一返回就写入（state=created）；看到第一个 `turn/started` 后改为 materialized |
-| `turns` | 本地 ID、`thread_id`、`codex_turn_id`（可空）、`inbound_ids`、`state`（pending / started / completed / interrupted / failed / unknown）、`final_text` | 调用 `turn()` **之前**写入 pending；拿到 turn handle 后记录 `codex_turn_id`；turn 完成时，在**同一个事务**里写入 `final_text` 和对应的 outbox 记录 |
-| `outbox` | `turn_id`、`kind`（final / async_question / notice）、`seq`、`text`、`state`（pending / sent / dead）、`attempts`、`platform_message_id`、`next_attempt_at` | 结果先持久化再投递；投递失败按退避策略重试 |
+| `turns` | 本地 ID、`thread_id`、`codex_turn_id`（可空）、`cwd`、`state`、`final_text` | 调用 `turn()` **之前**写入 pending；拿到 turn handle 后记录 `codex_turn_id`；turn 完成时，在**同一个事务**里写入 `final_text` 和对应的 outbox 记录。**未确认**状态：pending / started / reconciling（结果待从历史对账）/ abandoned（停止超时，本地已放弃等待），这些 turn 占着 cwd。**终态**：completed / interrupted / failed / unknown / released / retried |
+| `steers` | `turn_id`、`text`、`inbound_ids`、`state`（sending / unknown / accepted / rejected / absent / unconfirmed） | 追加操作的持久化意图（评审 R1），见下文"追加"一节 |
+| `outbox` | `turn_id`、`kind`（final / async_question / notice）、`seq`、`text`、`state`（pending / sent / dead）、`attempts`、`platform_message_id`、`next_attempt_at` | 结果先持久化再投递；投递失败按退避策略重试。**所有种类**的文本入库前都按平台上限分段（评审 R10）；async 提问的 `seq` = 问题序号 × 1000 + 分段序号，实时路径和恢复路径生成相同的记录，靠唯一约束去重 |
 
 **入站流程**：
 
@@ -229,16 +241,31 @@ codex-IM 只做一件事：**把 IM 消息接到 Codex 上，自身只是一层"
   - 编辑失败或没有这样的消息时，再发一条新消息。
 - 遇到临时失败（网络错误、限流）时，按平台的 retry-after 退避后重试。
 - 遇到永久失败（机器人被移出群、会话已不存在）时，标记为 dead 并记录日志，**不重新执行**。
+- **顺序跨扫描保持**（评审 R5）：每个会话只有最早的一条 pending 记录可以投递。它在退避期间，同会话后面的记录一律等待；它变成 sent 或 dead 之后，下一条才能发。其他会话不受影响。
 
-**重启恢复流程**（bridge 启动时）：
+**追加（steer）**（评审 R1）：
 
-1. outbox 里还是 pending 的记录：重新投递。
-2. 状态为 pending 或 started 的 turn：
-   - 先 `thread_resume`，再用 `thread.read(include_turns=True)` 按 `codex_turn_id` 查这个 turn：
-     - 已完成：取出最终回答写入 outbox 并投递，不重新执行；
-     - 中断或失败：标记为 interrupted，告诉用户"上次任务因为重启被中断，没有自动重跑；需要的话请发 `/retry`"。
-   - 没有 `codex_turn_id` 的（崩溃发生在 `turn/start` 请求发出之后、响应回来之前）：在 thread 里找记录时间之后开始、并且用户输入一致的 turn。找到了就按上面的规则处理；找不到就标记为 unknown，同样提示用户可以 `/retry`。
-3. inbound 里状态为 queued、还没有派发的消息：正常派发（它们还没有被执行过）。
+1. 在会话短锁内把这批消息从 `queued` 改为 `steering`，并写入一条 `steers` 记录（state=sending）。**先持久化意图，再发 RPC**。
+2. RPC 在锁外执行，有超时（`CODEX_IM_RPC_TIMEOUT`）。
+3. 结果：
+   - 成功：accepted，消息变为 `steered`；
+   - 服务端返回 JSON-RPC 拒绝（例如 turn 已经结束）：这能证明输入没有被接收，rejected，消息回到 `queued`，作为下一个 turn 执行；
+   - 超时、断线、或在 RPC 前后崩溃：结果未知，记为 unknown，消息变为 `steer_unknown`，**不会被自动执行**。
+4. unknown 的追加在 turn 结束后对照 Codex 历史判定：历史里该 turn 有这条输入 → steered；没有 → absent（消息标为 ignored，并告诉用户"没有送达，需要的话请重新发送"）；历史一直读不到 → unconfirmed（同样不重放，提示用户自行判断）。
+
+**重启恢复流程**（bridge 启动时，按这个顺序）：
+
+1. **先恢复所有未确认 turn 的 cwd 占用**（D6），然后才派发任何排队消息（评审 R3）。
+2. outbox 里还是 pending 的记录：重新投递。
+3. 状态为 sending 的追加：改为 unknown，随所属 turn 一起对账。
+4. 未确认的 turn：
+   - 先 `thread_resume`，再用 `thread.read(include_turns=True)` 查这个 turn；abandoned 的 turn 每轮还会用 turn id 再发一次 interrupt。
+   - 历史显示仍在运行（inProgress）：保持占用，按退避继续轮询（最长 60 秒一次，**没有截止时间**）。
+   - 已完成：取出最终回答写入 outbox 并投递，不重新执行。
+   - 失败：按失败投递。中断：用户主动停止的（abandoned）显示"已停止"；其他情况告诉用户"上次任务因为重启被中断，没有自动重跑；需要的话请发 `/retry`"。
+   - 历史里的 **async 提问**会以和实时路径相同的身份补进 outbox，并恢复待回答状态（评审 R7）。
+   - 没有 `codex_turn_id` 的记录（崩溃发生在 `turn/start` 请求发出之后、响应回来之前），只匹配同时满足以下条件的历史 turn（评审 R6）：首条输入和记录完全一致；`startedAt` 不早于记录创建时间（允许 5 秒时钟误差）；早于同一 thread 上下一条本地记录；没有被其他本地记录绑定。**恰好一个**候选才算匹配，匹配后立刻把 Codex turn id 写回记录，并修正 thread 的 materialized 状态（turn_count 只增加一次）。没有候选或有多个候选：标记为 unknown，提示用户可以 `/retry`。
+5. inbound 里状态为 queued、还没有派发的消息：正常派发（它们还没有被执行过；如果 cwd 被占用，会排队等待）。
 
 **续接失败要分类处理，不能一律新开 thread**：
 
@@ -263,17 +290,18 @@ idle ──turn()──► running ──完成/失败──► idle
                    └─/new ──► stopping ──► 切换当前 thread ──► idle
 ```
 
-- **状态变化通过每个会话的一把短锁串行化**。运行中可用的命令只需要拿这把短锁，不进入消息队列，所以不会被排在长时间运行的 turn 后面。
-- **`/new` 在 running 状态下**：
-  1. 先进入 stopping，并调用 `interrupt()`；
-  2. 等这个 turn 结束（有超时）；
-  3. 再切换当前 thread。
-
-  在这期间到达的消息排队，切换完成后派发到**新的** thread。
-- **`/stop` 和 `/new` 同时到达**：按到达顺序进入状态机。`/stop` 在 stopping 状态下不做任何操作（幂等），`/new` 等待 stopping 结束后再继续。
-- **stopping 超时**（turn 一直不结束）：标记这个 turn 为 unknown，强制切换，并告诉用户。迟到的事件按 `codex_turn_id` 归属到旧 turn，不会混入新 thread。
-- **`/resume` 只能在 idle 状态下执行**；在 running 状态下会提示先发 `/stop`。
-- **项目锁（D6）的获取顺序**：先拿会话锁，再拿项目锁；释放顺序相反，避免死锁。等待项目锁的 turn 处于 queued 状态，期间可以被 `/stop` 取消。
+- **状态变化通过每个会话的一把短锁串行化，这把锁里绝不等待网络**（评审 R4）。steer、interrupt、compact 等 RPC 都在锁外执行，并且都有超时。
+- **控制屏障**（评审 R2）：改变执行状态的命令在收到时立即竖起屏障（D7）。例如依次收到 `/stop`、`/new`、普通消息：旧 turn 被中断后，worker 发现屏障仍在，不会把普通消息交给旧 thread；等 `/new` 执行完、屏障放下，普通消息才派发到新 thread。
+- **`/stop` 和 `/new` 共用一个截止时间**（`CODEX_IM_STOP_TIMEOUT`，评审 R4），**interrupt RPC 本身也算在内**：
+  1. 进入 stopping，在截止时间内调用 `interrupt()`；
+  2. 在剩余时间内等这个 turn 结束；
+  3. 到截止时间还没结束：**放弃**本地消费者，turn 标为 abandoned，**cwd 继续占用**（D6），通知用户，并由对账继续尝试中断、轮询历史；
+  4. `/new` 接着切换当前 thread。新 thread 的第一个 turn 会等待旧 turn 释放占用。
+- `/stop` 在 stopping 状态下不做任何操作（幂等）。在空闲状态下，如果本会话还有未确认的 turn，会立即再次触发对账和 interrupt，并提示可以用 `/release`。
+- `/stop` 和 `/new` 都会关闭当前 thread 的待回答问题（评审 R11）。
+- 迟到的事件按 `codex_turn_id` 归属到旧 turn，不会混入新 thread。
+- **`/resume`、`/retry`、`/release` 只能在 idle 状态下执行**；在 running 状态下会提示先发 `/stop`。
+- 等待 cwd 占用的 turn 处于 running 状态但还没有 handle，期间可以被 `/stop` 取消。
 
 ## 3. 架构
 
@@ -357,7 +385,7 @@ class PlatformAdapter(Protocol):
 3. 会话 worker 取出排队的消息：
    - 当前 thread 不存在时，先通过 `agentd` 确保 cwd 存在，再 `thread_start`，**立即写入 `threads`**；
    - 存在时用 `thread_resume`，失败按 D14 分类处理。
-4. 有活动 turn 时用 `steer()` 追加；否则先获取项目锁（如果绑定了项目），写入 `turns`（pending），然后调用 `thread.turn(input)`，记录 `codex_turn_id`。
+4. 有活动 turn 时按 D14 的规则追加；否则先占用 cwd（D6），写入 `turns`（pending），然后调用 `thread.turn(input)`，记录 `codex_turn_id`。
 5. Renderer 消费 `stream()` 的事件：
    - 先发占位消息，之后节流编辑；
    - `delivery=async` 的消息立即写入 outbox 并单独投递。

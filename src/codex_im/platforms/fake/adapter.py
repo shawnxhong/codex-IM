@@ -92,7 +92,10 @@ class FakeAdapter(PlatformAdapter):
         )
         return await self._sink(msg)
 
-    def _maybe_fail(self) -> None:
+    def _maybe_fail(self, text: str) -> None:
+        if len(text) > self.capabilities.max_text_len:
+            # Like Telegram's "message is too long": a permanent rejection (review R10).
+            raise DeliveryError("message is too long", transient=False)
         if self._fail_permanent:
             raise DeliveryError("fake permanent failure", transient=False)
         if self._fail_transient > 0:
@@ -100,7 +103,7 @@ class FakeAdapter(PlatformAdapter):
             raise DeliveryError("fake transient failure", transient=True)
 
     async def send(self, chat: ChatRef, text: str, *, reply_to: str | None = None, final: bool = True) -> MessageRef:
-        self._maybe_fail()
+        self._maybe_fail(text)
         message_id = str(next(self._ids))
         self.events.append(
             {
@@ -118,7 +121,7 @@ class FakeAdapter(PlatformAdapter):
     async def edit(self, ref: MessageRef, text: str, *, final: bool = True) -> None:
         if not self.capabilities.can_edit:
             raise EditNotPossible("editing disabled")
-        self._maybe_fail()
+        self._maybe_fail(text)
         self.events.append(
             {"op": "edit", "chat_id": ref.chat_id, "topic": ref.topic, "message_id": ref.message_id, "text": text, "final": final}
         )

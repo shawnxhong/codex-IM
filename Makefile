@@ -24,10 +24,12 @@ down:
 logs:
 	$(COMPOSE) logs -f --tail=200 bridge agent egress-proxy
 
-login: ## ChatGPT device-code login inside the agent container (once)
+login: ## ChatGPT device-code login inside the agent container (once); starts egress-proxy first (R9)
+	$(COMPOSE) up -d --wait egress-proxy
 	$(COMPOSE) run --rm agent codex login --device-auth
 
-smoke: ## post-upgrade smoke test through the real relay
+smoke: ## post-upgrade smoke test through the real relay; needs egress-proxy and agent running (R9)
+	$(COMPOSE) up -d --wait egress-proxy agent
 	$(COMPOSE) run --rm --entrypoint python bridge -m codex_im.smoke
 
 up-fake: ## bridge with the fake platform for docs/verification.md scenarios

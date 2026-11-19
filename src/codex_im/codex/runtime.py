@@ -1,7 +1,8 @@
 """The only place that talks to Codex, and only through the public ``openai_codex`` API (D2, AGENTS.md).
 
 Every thread and turn explicitly sets sandbox=full_access and approval_mode=deny_all (D4) and passes the
-model (D6). Nothing else is injected (D3).
+model (D6). Nothing else is injected (D3). Every request is bounded by ``rpc_timeout`` because the SDK's
+request path has no timeout of its own (review R4); a timed-out request is *uncertain*, never "not sent".
 """
 
 from __future__ import annotations
@@ -9,15 +10,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import Any
+from collections.abc import Awaitable
+from typing import Any, TypeVar
 
-from openai_codex import ApprovalMode, AsyncCodex, CodexConfig, Sandbox
+from openai_codex import ApprovalMode, AsyncCodex, AsyncTurnHandle, CodexConfig, Sandbox
 
 from .. import __version__
 from ..config import Settings, parse_tcp_url
 from ..logutil import h
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 def build_codex_config(settings: Settings) -> CodexConfig:
@@ -30,8 +33,7 @@ def build_codex_config(settings: Settings) -> CodexConfig:
         return CodexConfig(**common)
     host, port = parse_tcp_url(settings.app_server)
     # D5: the SDK's "subprocess" is a stdio <-> TCP relay to `codex app-server --listen stdio://` in the
-    # agent container. VERIFY(ubuntu): V0 — launch_args_override exists in the pinned SDK release and the
-    # relay supports initialize, concurrent turns and reconnects.
+    # agent container. VERIFY(ubuntu): V0 — the relay supports initialize, concurrent turns and reconnects.
     return CodexConfig(launch_args_override=("socat", "-", f"TCP:{host}:{port}"), **common)
 
 
@@ -49,12 +51,15 @@ class CodexRuntime:
     def connected(self) -> bool:
         return self._codex is not None
 
+    async def _bounded(self, awaitable: Awaitable[T]) -> T:
+        return await asyncio.wait_for(awaitable, self._settings.rpc_timeout)
+
     async def _client(self) -> AsyncCodex:
         async with self._lock:
             if self._codex is None:
                 codex = AsyncCodex(build_codex_config(self._settings))
                 try:
-                    await codex.__aenter__()
+                    await self._bounded(codex.__aenter__())
                 except BaseException:
                     with contextlib.suppress(Exception):
                         await codex.close()
@@ -72,7 +77,7 @@ class CodexRuntime:
         if codex is not None:
             log.warning("resetting codex connection (generation %d)", self.generation)
             with contextlib.suppress(Exception):
-                await codex.close()
+                await asyncio.wait_for(codex.close(), 10)
 
     @staticmethod
     def _policy() -> dict[str, Any]:
@@ -80,12 +85,14 @@ class CodexRuntime:
 
     async def start_thread(self, *, cwd: str, model: str, provider: str) -> str:
         codex = await self._client()
-        thread = await codex.thread_start(
-            cwd=cwd,
-            model=model,
-            model_provider=provider,
-            developer_instructions=self._settings.developer_instructions,
-            **self._policy(),
+        thread = await self._bounded(
+            codex.thread_start(
+                cwd=cwd,
+                model=model,
+                model_provider=provider,
+                developer_instructions=self._settings.developer_instructions,
+                **self._policy(),
+            )
         )
         self._threads[thread.id] = thread
         log.info("thread started %s", h(thread.id))
@@ -96,12 +103,8 @@ class CodexRuntime:
         codex = await self._client()
         thread = self._threads.get(thread_id)
         if thread is None:
-            thread = await codex.thread_resume(
-                thread_id,
-                cwd=cwd,
-                model=model,
-                model_provider=provider,
-                **self._policy(),
+            thread = await self._bounded(
+                codex.thread_resume(thread_id, cwd=cwd, model=model, model_provider=provider, **self._policy())
             )
             if str(thread.id) != thread_id:
                 raise RuntimeError(f"resume returned a different thread ({h(thread.id)} != {h(thread_id)})")
@@ -112,27 +115,34 @@ class CodexRuntime:
     def is_loaded(self, thread_id: str) -> bool:
         return thread_id in self._threads
 
-    async def start_turn(self, thread_id: str, text: str, *, model: str, cwd: str) -> Any:
-        """Start a turn on a loaded thread and return the AsyncTurnHandle."""
-        await self._client()
+    def _loaded(self, thread_id: str) -> Any:
         thread = self._threads.get(thread_id)
         if thread is None:
             raise RuntimeError("thread is not loaded on the current connection")
-        return await thread.turn(text, model=model, cwd=cwd, **self._policy())
+        return thread
+
+    async def start_turn(self, thread_id: str, text: str, *, model: str, cwd: str) -> Any:
+        """Start a turn on a loaded thread and return the AsyncTurnHandle. A timeout here is uncertain."""
+        await self._client()
+        return await self._bounded(self._loaded(thread_id).turn(text, model=model, cwd=cwd, **self._policy()))
+
+    async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
+        """Interrupt a turn that has no live handle (abandoned / reconciling, review R3).
+
+        ``AsyncTurnHandle`` is an exported class; constructing it for a known turn id is how the public API
+        addresses a turn. VERIFY(ubuntu): V5-4 — effect on a turn started on an earlier connection.
+        """
+        codex = await self._client()
+        handle = AsyncTurnHandle(codex, thread_id, turn_id)
+        await self._bounded(handle.interrupt())
 
     async def read_turns(self, thread_id: str) -> list[dict[str, Any]]:
         await self._client()
-        thread = self._threads.get(thread_id)
-        if thread is None:
-            raise RuntimeError("thread is not loaded on the current connection")
-        response = await thread.read(include_turns=True)
+        response = await self._bounded(self._loaded(thread_id).read(include_turns=True))
         data = response.model_dump(mode="json", by_alias=True)
         turns = (data.get("thread") or {}).get("turns") or []
         return [t for t in turns if isinstance(t, dict)]
 
     async def compact(self, thread_id: str) -> None:
         await self._client()
-        thread = self._threads.get(thread_id)
-        if thread is None:
-            raise RuntimeError("thread is not loaded on the current connection")
-        await thread.compact()
+        await self._bounded(self._loaded(thread_id).compact())

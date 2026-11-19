@@ -58,7 +58,7 @@ wire_api = "responses"
 | `CODEX_IM_DEFAULT_PROVIDER` | 新会话默认使用的 provider | `openai` 或 `custom` |
 | `CODEX_IM_DEFAULT_MODEL` | 默认 model；bridge 在每个 thread 和 turn 上**显式传 model**，不依赖 Codex 的默认值 | `gpt-5.x` |
 | `CODEX_IM_ALLOWED_PROVIDERS` | 允许 `/provider` 切换到的 provider 列表 | `openai,custom` |
-| `CODEX_IM_PROVIDER_ADMINS` | 允许切换 provider 的用户（可选，默认所有白名单用户） | `telegram:123,feishu:ou_xxx` |
+| `CODEX_IM_ADMINS` | 管理员：可以使用 `/provider` 和 `/release`（可选，默认所有白名单用户；旧名 `CODEX_IM_PROVIDER_ADMINS` 仍然有效） | `telegram:123,feishu:ou_xxx` |
 | `CODEX_IM_PROVIDER_API_KEY` | 自定义 provider 的 key，**只注入 agent 容器** | — |
 
 几条规则：

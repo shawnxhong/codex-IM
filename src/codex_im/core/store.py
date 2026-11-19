@@ -6,6 +6,7 @@ must be atomic goes through :meth:`Store.tx`.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -30,7 +31,8 @@ CREATE TABLE IF NOT EXISTS inbound (
     is_group      INTEGER NOT NULL DEFAULT 0,
     composed      INTEGER NOT NULL DEFAULT 0,  -- text already carries sender tags (e.g. /retry)
     kind          TEXT NOT NULL,                -- message | command
-    state         TEXT NOT NULL,                -- queued | dispatched | steered | done | ignored
+    -- queued (auto-executable) | dispatched | steering | steered | steer_unknown | done | ignored
+    state         TEXT NOT NULL,
     turn_id       INTEGER,
     received_at   REAL NOT NULL,
     UNIQUE (platform, message_key)
@@ -67,7 +69,10 @@ CREATE TABLE IF NOT EXISTS turns (
     thread_id         TEXT NOT NULL,
     codex_turn_id     TEXT,
     input_text        TEXT NOT NULL,
-    state             TEXT NOT NULL,  -- pending | started | reconciling | completed | interrupted | failed | unknown | retried
+    -- unresolved (remote outcome not confirmed; the cwd stays held): pending | started | reconciling | abandoned
+    -- terminal: completed | interrupted | failed | unknown | released | retried
+    state             TEXT NOT NULL,
+    cwd               TEXT,
     final_text        TEXT,
     error             TEXT,
     stream_ref_json   TEXT,
@@ -78,12 +83,22 @@ CREATE TABLE IF NOT EXISTS turns (
 CREATE INDEX IF NOT EXISTS turns_state ON turns (state);
 CREATE INDEX IF NOT EXISTS turns_session ON turns (session_key, id);
 
+CREATE TABLE IF NOT EXISTS steers (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_id       INTEGER NOT NULL,
+    text          TEXT NOT NULL,
+    inbound_ids   TEXT NOT NULL,   -- JSON list
+    state         TEXT NOT NULL,   -- sending | unknown | accepted | rejected | absent
+    created_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS steers_turn ON steers (turn_id, state);
+
 CREATE TABLE IF NOT EXISTS outbox (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     session_key         TEXT NOT NULL,
     chat_json           TEXT NOT NULL,
     turn_id             INTEGER,
-    kind                TEXT NOT NULL,  -- final | async_question | notice | recovery
+    kind                TEXT NOT NULL,  -- final | async_question | notice
     seq                 INTEGER NOT NULL DEFAULT 0,
     text                TEXT NOT NULL,
     edit_ref_json       TEXT,
@@ -97,6 +112,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     UNIQUE (turn_id, kind, seq)
 );
 CREATE INDEX IF NOT EXISTS outbox_due ON outbox (state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS outbox_session ON outbox (session_key, state, id);
 
 CREATE TABLE IF NOT EXISTS open_questions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,6 +122,7 @@ CREATE TABLE IF NOT EXISTS open_questions (
     created_at  REAL NOT NULL,
     closed_at   REAL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS open_questions_item ON open_questions (thread_id, item_id);
 
 CREATE TABLE IF NOT EXISTS kv (
     k TEXT PRIMARY KEY,
@@ -113,8 +130,15 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 """
 
-UNFINISHED_TURN_STATES = ("pending", "started", "reconciling")
-RETRYABLE_TURN_STATES = ("interrupted", "unknown", "failed")
+# Turns whose remote outcome is not confirmed. Their cwd stays held (D6, D14, review R3).
+UNFINISHED_TURN_STATES = ("pending", "started", "reconciling", "abandoned")
+RETRYABLE_TURN_STATES = ("interrupted", "unknown", "failed", "released")
+UNRESOLVED_STEER_STATES = ("sending", "unknown")
+
+# Columns added after the first schema version; added to existing databases on open.
+_ADDED_COLUMNS = {"turns": {"cwd": "TEXT"}}
+
+_OUTBOX_HEADS = "SELECT session_key, MIN(id) AS id FROM outbox WHERE state = 'pending' GROUP BY session_key"
 
 
 @dataclass(slots=True)
@@ -138,6 +162,14 @@ class Store:
             self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        for table, columns in _ADDED_COLUMNS.items():
+            existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in columns.items():
+                if name not in existing:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         with self._lock:
@@ -168,6 +200,10 @@ class Store:
         with self._lock:
             return self._conn.execute(sql, args)
 
+    @staticmethod
+    def _marks(values: Sequence[object]) -> str:
+        return ",".join("?" for _ in values)
+
     # ------------------------------------------------------------------ kv
     def kv_get(self, key: str) -> str | None:
         row = self._one("SELECT v FROM kv WHERE k = ?", (key,))
@@ -175,6 +211,9 @@ class Store:
 
     def kv_set(self, key: str, value: str) -> None:
         self._exec("INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", (key, value))
+
+    def kv_set_if_absent(self, key: str, value: str) -> None:
+        self._exec("INSERT OR IGNORE INTO kv (k, v) VALUES (?, ?)", (key, value))
 
     # ------------------------------------------------------------------ inbound
     def insert_inbound(
@@ -220,17 +259,14 @@ class Store:
         )
 
     def sessions_with_queued(self) -> list[str]:
-        rows = self._all(
-            "SELECT DISTINCT session_key FROM inbound WHERE kind = 'message' AND state = 'queued'"
-        )
+        rows = self._all("SELECT DISTINCT session_key FROM inbound WHERE kind = 'message' AND state = 'queued'")
         return [str(r["session_key"]) for r in rows]
 
     def set_inbound_state(self, ids: Sequence[int], state: str, turn_id: int | None = None) -> None:
         if not ids:
             return
-        marks = ",".join("?" for _ in ids)
         self._exec(
-            f"UPDATE inbound SET state = ?, turn_id = COALESCE(?, turn_id) WHERE id IN ({marks})",
+            f"UPDATE inbound SET state = ?, turn_id = COALESCE(?, turn_id) WHERE id IN ({self._marks(ids)})",
             (state, turn_id, *ids),
         )
 
@@ -310,42 +346,67 @@ class Store:
 
     # ------------------------------------------------------------------ turns
     def create_turn(
-        self, session_key: str, thread_id: str, input_text: str, inbound_ids: Sequence[int], reply_to: str | None
+        self,
+        session_key: str,
+        thread_id: str,
+        input_text: str,
+        inbound_ids: Sequence[int],
+        reply_to: str | None,
+        cwd: str | None = None,
     ) -> int:
         now = time.time()
         with self.tx() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO turns (session_key, thread_id, input_text, state, reply_to, created_at)
-                VALUES (?, ?, ?, 'pending', ?, ?)
+                INSERT INTO turns (session_key, thread_id, input_text, state, cwd, reply_to, created_at)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?)
                 """,
-                (session_key, thread_id, input_text, reply_to, now),
+                (session_key, thread_id, input_text, cwd, reply_to, now),
             )
             turn_id = int(cur.lastrowid)
             if inbound_ids:
-                marks = ",".join("?" for _ in inbound_ids)
                 conn.execute(
-                    f"UPDATE inbound SET state = 'dispatched', turn_id = ? WHERE id IN ({marks})",
+                    f"UPDATE inbound SET state = 'dispatched', turn_id = ? WHERE id IN ({self._marks(inbound_ids)})",
                     (turn_id, *inbound_ids),
                 )
             return turn_id
 
+    def _count_turn(self, conn: sqlite3.Connection, thread_id: str, now: float) -> None:
+        conn.execute(
+            """
+            UPDATE threads SET turn_count = turn_count + 1, last_active_at = ?,
+                state = CASE WHEN state = 'created' THEN 'materialized' ELSE state END
+            WHERE thread_id = ?
+            """,
+            (now, thread_id),
+        )
+
     def set_turn_started(self, turn_id: int, codex_turn_id: str) -> None:
         now = time.time()
         with self.tx() as conn:
+            row = conn.execute("SELECT thread_id, codex_turn_id FROM turns WHERE id = ?", (turn_id,)).fetchone()
+            if row is None:
+                return
             conn.execute(
-                "UPDATE turns SET codex_turn_id = ?, state = 'started' WHERE id = ?", (codex_turn_id, turn_id)
+                """
+                UPDATE turns SET codex_turn_id = ?,
+                    state = CASE WHEN state = 'pending' THEN 'started' ELSE state END
+                WHERE id = ?
+                """,
+                (codex_turn_id, turn_id),
             )
-            row = conn.execute("SELECT thread_id FROM turns WHERE id = ?", (turn_id,)).fetchone()
-            if row is not None:
-                conn.execute(
-                    """
-                    UPDATE threads SET turn_count = turn_count + 1, last_active_at = ?,
-                        state = CASE WHEN state = 'created' THEN 'materialized' ELSE state END
-                    WHERE thread_id = ?
-                    """,
-                    (now, row["thread_id"]),
-                )
+            if not row["codex_turn_id"]:
+                self._count_turn(conn, row["thread_id"], now)
+
+    def bind_codex_turn(self, turn_id: int, codex_turn_id: str) -> None:
+        """Recovery found the Codex turn of a record that never stored its id (R6). Counts it exactly once."""
+        now = time.time()
+        with self.tx() as conn:
+            row = conn.execute("SELECT thread_id, codex_turn_id FROM turns WHERE id = ?", (turn_id,)).fetchone()
+            if row is None or row["codex_turn_id"]:
+                return
+            conn.execute("UPDATE turns SET codex_turn_id = ? WHERE id = ?", (codex_turn_id, turn_id))
+            self._count_turn(conn, row["thread_id"], now)
 
     def set_turn_stream_ref(self, turn_id: int, ref_json: str) -> None:
         self._exec("UPDATE turns SET stream_ref_json = ? WHERE id = ?", (ref_json, turn_id))
@@ -359,9 +420,21 @@ class Store:
     def has_codex_turn(self, codex_turn_id: str) -> bool:
         return self._one("SELECT 1 FROM turns WHERE codex_turn_id = ?", (codex_turn_id,)) is not None
 
-    def unfinished_turns(self) -> list[sqlite3.Row]:
-        marks = ",".join("?" for _ in UNFINISHED_TURN_STATES)
-        return self._all(f"SELECT * FROM turns WHERE state IN ({marks}) ORDER BY id", UNFINISHED_TURN_STATES)
+    def unfinished_turns(self, session_key: str | None = None) -> list[sqlite3.Row]:
+        """Unresolved turns with the cwd they hold (``hold_cwd``; older rows fall back to the thread's cwd)."""
+        sql = f"""
+            SELECT t.*, COALESCE(t.cwd, th.cwd) AS hold_cwd FROM turns t
+            LEFT JOIN threads th ON th.thread_id = t.thread_id
+            WHERE t.state IN ({self._marks(UNFINISHED_TURN_STATES)})
+        """
+        args: list[object] = list(UNFINISHED_TURN_STATES)
+        if session_key is not None:
+            sql += " AND t.session_key = ?"
+            args.append(session_key)
+        return self._all(sql + " ORDER BY t.id", args)
+
+    def turns_of_thread_after(self, thread_id: str, turn_id: int) -> list[sqlite3.Row]:
+        return self._all("SELECT * FROM turns WHERE thread_id = ? AND id > ? ORDER BY id", (thread_id, turn_id))
 
     def last_retryable_turn(self, session_key: str) -> sqlite3.Row | None:
         row = self._one("SELECT * FROM turns WHERE session_key = ? ORDER BY id DESC LIMIT 1", (session_key,))
@@ -399,6 +472,64 @@ class Store:
                     (session_key, chat_json, turn_id, row.kind, row.seq, row.text, row.edit_ref_json, row.reply_to, now, now),
                 )
 
+    # ------------------------------------------------------------------ steers (D14, review R1)
+    def begin_steer(self, turn_id: int, text: str, inbound_ids: Sequence[int]) -> int:
+        """Persist the intent *before* sending: the rows leave the auto-execution queue first."""
+        now = time.time()
+        with self.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO steers (turn_id, text, inbound_ids, state, created_at) VALUES (?, ?, ?, 'sending', ?)",
+                (turn_id, text, json.dumps(list(inbound_ids)), now),
+            )
+            if inbound_ids:
+                conn.execute(
+                    f"UPDATE inbound SET state = 'steering', turn_id = ? WHERE id IN ({self._marks(inbound_ids)})",
+                    (turn_id, *inbound_ids),
+                )
+            return int(cur.lastrowid)
+
+    def _finish_steer(self, steer_id: int, steer_state: str, inbound_state: str, *, clear_turn: bool = False) -> None:
+        with self.tx() as conn:
+            row = conn.execute("SELECT inbound_ids FROM steers WHERE id = ?", (steer_id,)).fetchone()
+            if row is None:
+                return
+            ids = json.loads(row["inbound_ids"])
+            conn.execute("UPDATE steers SET state = ? WHERE id = ?", (steer_state, steer_id))
+            if ids:
+                turn_sql = ", turn_id = NULL" if clear_turn else ""
+                conn.execute(
+                    f"UPDATE inbound SET state = ?{turn_sql} WHERE id IN ({self._marks(ids)})", (inbound_state, *ids)
+                )
+
+    def accept_steer(self, steer_id: int) -> None:
+        self._finish_steer(steer_id, "accepted", "steered")
+
+    def reject_steer(self, steer_id: int) -> None:
+        """The server provably refused the input, so it may run as a normal turn."""
+        self._finish_steer(steer_id, "rejected", "queued", clear_turn=True)
+
+    def mark_steer_unknown(self, steer_id: int) -> None:
+        self._finish_steer(steer_id, "unknown", "steer_unknown")
+
+    def steer_absent(self, steer_id: int) -> None:
+        """The finished turn's history does not contain the input: never executed, and never replayed."""
+        self._finish_steer(steer_id, "absent", "ignored")
+
+    def steer_unconfirmed(self, steer_id: int) -> None:
+        """History could not be read in time: outcome stays unknown, the input is still never replayed."""
+        self._finish_steer(steer_id, "unconfirmed", "ignored")
+
+    def unresolved_steers(self, turn_id: int | None = None) -> list[sqlite3.Row]:
+        if turn_id is None:
+            return self._all(
+                f"SELECT * FROM steers WHERE state IN ({self._marks(UNRESOLVED_STEER_STATES)}) ORDER BY id",
+                UNRESOLVED_STEER_STATES,
+            )
+        return self._all(
+            f"SELECT * FROM steers WHERE turn_id = ? AND state IN ({self._marks(UNRESOLVED_STEER_STATES)}) ORDER BY id",
+            (turn_id, *UNRESOLVED_STEER_STATES),
+        )
+
     # ------------------------------------------------------------------ outbox
     def add_outbox(
         self,
@@ -430,12 +561,15 @@ class Store:
             (now, limit),
         )
 
-    def pending_outbox_for_sessions(self) -> set[str]:
-        rows = self._all("SELECT DISTINCT session_key FROM outbox WHERE state = 'pending'")
-        return {str(r["session_key"]) for r in rows}
+    def due_outbox_heads(self, now: float) -> list[sqlite3.Row]:
+        """The earliest pending row of each session, if it is due. Later rows never overtake it (review R5)."""
+        return self._all(
+            f"SELECT o.* FROM outbox o JOIN ({_OUTBOX_HEADS}) h ON o.id = h.id WHERE o.next_attempt_at <= ? ORDER BY o.id",
+            (now,),
+        )
 
     def next_outbox_due(self) -> float | None:
-        row = self._one("SELECT MIN(next_attempt_at) AS t FROM outbox WHERE state = 'pending'")
+        row = self._one(f"SELECT MIN(o.next_attempt_at) AS t FROM outbox o JOIN ({_OUTBOX_HEADS}) h ON o.id = h.id")
         if row is None or row["t"] is None:
             return None
         return float(row["t"])
@@ -461,7 +595,7 @@ class Store:
     # ------------------------------------------------------------------ open questions
     def add_open_question(self, thread_id: str, turn_id: int | None, item_id: str | None) -> None:
         self._exec(
-            "INSERT INTO open_questions (thread_id, turn_id, item_id, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO open_questions (thread_id, turn_id, item_id, created_at) VALUES (?, ?, ?, ?)",
             (thread_id, turn_id, item_id, time.time()),
         )
 

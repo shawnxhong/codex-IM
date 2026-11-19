@@ -1,14 +1,14 @@
 """Working directories and project concurrency (design D6).
 
 - Default cwd includes the *full* session identity: <root>/sessions/<platform>/<chat>/<topic>.
-- A session bound to a project uses either the project path under a project-wide lock (``serial``, default)
-  or its own git worktree (``worktree``). Directories and worktrees are created by agentd, never by the
-  bridge (D5).
+- A session bound to a project uses either the shared project path (``serial``, default) or its own git
+  worktree (``worktree``). Mutual exclusion is a hold on the cwd (core/holds.py), so ``serial`` sessions
+  queue behind each other and ``worktree`` sessions run in parallel. Directories and worktrees are created
+  by agentd, never by the bridge (D5).
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
 import posixpath
@@ -103,7 +103,6 @@ class Workspace:
         self._agentd = agentd
         self.projects = projects
         self._bindings = bindings
-        self._locks: dict[str, asyncio.Lock] = {}
 
     @classmethod
     def from_settings(cls, settings: Any, agentd: Any) -> Workspace:
@@ -150,10 +149,3 @@ class Workspace:
         await self._agentd.worktree_add(project.path, path, branch)
         return path
 
-    def project_lock(self, project_name: str | None) -> asyncio.Lock | None:
-        if not project_name:
-            return None
-        project = self.projects.get(project_name)
-        if project is None or project.concurrency != "serial":
-            return None
-        return self._locks.setdefault(project_name, asyncio.Lock())

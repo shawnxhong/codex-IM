@@ -1,4 +1,9 @@
-"""Durable delivery (design D14): persist first, deliver later, retry transient failures, never re-execute."""
+"""Durable delivery (design D14): persist first, deliver later, retry transient failures, never re-execute.
+
+Per-session order is kept across scans: only the earliest pending row of a session is eligible, so a row in
+backoff blocks later rows of the same session (review R5). Every text is chunked to the platform limit
+before it is stored (review R10).
+"""
 
 from __future__ import annotations
 
@@ -11,12 +16,14 @@ from collections.abc import Mapping
 from ..faults import Faults, InjectedDeliveryFailure
 from ..logutil import h
 from ..platforms.base import DeliveryError, EditNotPossible, PlatformAdapter
+from .markup import chunk_text
 from .store import Store
-from .types import ChatRef, MessageRef
+from .types import DEFAULT_CAPABILITIES, ChatRef, MessageRef
 
 log = logging.getLogger(__name__)
 MAX_ATTEMPTS = 30
 MAX_BACKOFF = 300.0
+QUESTION_SEQ_STRIDE = 1000  # async question n, chunk k -> seq n*1000 + k (stable across live and recovery)
 
 
 def backoff(attempts: int) -> float:
@@ -35,21 +42,34 @@ class Outbox:
     def notify(self) -> None:
         self._wake.set()
 
+    def chunks(self, chat: ChatRef, text: str) -> list[str]:
+        adapter = self._adapters.get(chat.platform)
+        caps = adapter.capabilities if adapter is not None else DEFAULT_CAPABILITIES
+        return chunk_text(text, caps.chunk_len) or [text]
+
     def notice(self, session_key: str, chat: ChatRef, text: str, *, reply_to: str | None = None) -> None:
-        self._store.add_outbox(
-            session_key=session_key, chat_json=chat.to_json(), kind="notice", text=text, reply_to=reply_to
-        )
+        for index, chunk in enumerate(self.chunks(chat, text)):
+            self._store.add_outbox(
+                session_key=session_key,
+                chat_json=chat.to_json(),
+                kind="notice",
+                text=chunk,
+                seq=index,
+                reply_to=reply_to if index == 0 else None,
+            )
         self.notify()
 
-    def async_question(self, session_key: str, chat: ChatRef, turn_id: int, seq: int, text: str) -> None:
-        self._store.add_outbox(
-            session_key=session_key,
-            chat_json=chat.to_json(),
-            kind="async_question",
-            text=text,
-            turn_id=turn_id,
-            seq=seq,
-        )
+    def async_question(self, session_key: str, chat: ChatRef, turn_id: int, question_index: int, text: str) -> None:
+        """Idempotent per (turn, question, chunk): the live path and recovery produce the same rows."""
+        for index, chunk in enumerate(self.chunks(chat, text)):
+            self._store.add_outbox(
+                session_key=session_key,
+                chat_json=chat.to_json(),
+                kind="async_question",
+                text=chunk,
+                turn_id=turn_id,
+                seq=question_index * QUESTION_SEQ_STRIDE + index,
+            )
         self.notify()
 
     def stop(self) -> None:
@@ -70,16 +90,19 @@ class Outbox:
 
     async def deliver_due(self) -> None:
         async with self._lock:
-            blocked: set[str] = set()
-            for row in self._store.due_outbox(time.time()):
-                session_key = str(row["session_key"])
-                if session_key in blocked:
-                    continue  # keep per-session order: later rows wait for the failed one
-                if not await self._deliver(row):
-                    blocked.add(session_key)
+            for _ in range(1000):  # bounded: each pass delivers at most one row per session
+                heads = self._store.due_outbox_heads(time.time())
+                if not heads:
+                    return
+                progressed = False
+                for row in heads:
+                    if await self._deliver(row):
+                        progressed = True
+                if not progressed:
+                    return
 
     async def _deliver(self, row) -> bool:  # noqa: ANN001 - sqlite3.Row
-        """Returns False when the row is still pending (transient failure)."""
+        """True when the row left 'pending' (sent or dead); False while it waits for a retry."""
         outbox_id = int(row["id"])
         chat = ChatRef.from_json(row["chat_json"])
         adapter = self._adapters.get(chat.platform)

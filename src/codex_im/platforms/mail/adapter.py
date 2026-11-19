@@ -1,6 +1,7 @@
 """Email via IMAP polling + SMTP. P0a final-only platform (cannot edit).
 
-- A session is one email thread (root of References / In-Reply-To), see D6.
+- A session is one email thread (D6). Every received and sent Message-ID is mapped to the session root, and
+  the root of a new mail is found through its nearest known parent (review R8).
 - Messages are marked \\Seen only after the router has durably recorded them (D14); redelivery is
   deduplicated by Message-ID.
 - Sender authentication via Authentication-Results (D9); automated mail is dropped.
@@ -22,6 +23,7 @@ import os
 import smtplib
 import ssl
 from collections.abc import Mapping
+from typing import Any
 from email.message import EmailMessage
 from email.utils import make_msgid, parseaddr
 
@@ -30,10 +32,11 @@ from ...core.types import Capabilities, ChatRef, InboundMessage, MessageRef
 from ...logutil import h
 from ..base import DeliveryError, InboundSink, InstanceLock, PlatformAdapter
 from .auth import verify_sender
-from .parse import extract_body, is_automated, parse_email, thread_root
+from .parse import extract_body, is_automated, parse_email, reference_ids, reply_chain
 
 log = logging.getLogger(__name__)
 MAX_PER_POLL = 50
+ROOT_KEY = "email.root:"
 IO_TIMEOUT = 60
 
 
@@ -41,8 +44,9 @@ class EmailAdapter(PlatformAdapter):
     name = "email"
     capabilities = Capabilities(can_edit=False, max_text_len=50_000, supports_typing=False)
 
-    def __init__(self, *, data_dir: str, env: Mapping[str, str] | None = None) -> None:
+    def __init__(self, *, data_dir: str, store: Any = None, env: Mapping[str, str] | None = None) -> None:
         env = os.environ if env is None else env
+        self._store = store
 
         def need(key: str) -> str:
             value = (env.get(key) or "").strip()
@@ -180,12 +184,14 @@ class EmailAdapter(PlatformAdapter):
         message_id = str(msg.get("Message-ID") or "").strip()
         if not message_id:
             message_id = f"<synthetic-{hashlib.sha256(raw).hexdigest()[:24]}@codex-im>"
-        root, references = thread_root(msg, message_id)
+        references, in_reply_to = reference_ids(msg)
+        root = self.resolve_root(message_id, references, in_reply_to)
         subject = str(msg.get("Subject") or "").strip()
         body = extract_body(msg) or subject
         if not body.strip():
             return None
-        chain = (references + [message_id])[-20:]
+        self._remember(message_id, root)
+        chain = reply_chain(root, references, in_reply_to, message_id)
         chat = ChatRef(
             self.name,
             root,
@@ -203,6 +209,26 @@ class EmailAdapter(PlatformAdapter):
             mentions_bot=True,
             reply_to=message_id,
         )
+
+    def resolve_root(self, message_id: str, references: list[str], in_reply_to: list[str]) -> str:
+        """Session root of a mail: the root of its nearest known ancestor, else the oldest reference."""
+        if self._store is not None:
+            for mid in [*in_reply_to, *reversed(references)]:
+                known = self._store.kv_get(ROOT_KEY + mid)
+                if known:
+                    return known
+            own = self._store.kv_get(ROOT_KEY + message_id)
+            if own:
+                return own
+        if references:
+            return references[0]
+        if in_reply_to:
+            return in_reply_to[0]
+        return message_id
+
+    def _remember(self, message_id: str, root: str) -> None:
+        if self._store is not None:
+            self._store.kv_set_if_absent(ROOT_KEY + message_id, root)
 
     # ------------------------------------------------------------------ outbound
     def build_reply(self, chat: ChatRef, text: str) -> EmailMessage:
@@ -247,4 +273,5 @@ class EmailAdapter(PlatformAdapter):
             raise DeliveryError(f"SMTP {exc.smtp_code}", transient=not 500 <= exc.smtp_code < 600) from exc
         except (smtplib.SMTPException, OSError) as exc:
             raise DeliveryError(type(exc).__name__, transient=True) from exc
+        self._remember(str(msg["Message-ID"]), chat.chat_id)  # replies to our reply stay in this session
         return MessageRef(self.name, chat.chat_id, str(msg["Message-ID"]))

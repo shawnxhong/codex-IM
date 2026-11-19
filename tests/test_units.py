@@ -9,7 +9,7 @@ from codex_im.codex.errors import ErrorKind, classify
 from codex_im.codex.events import format_questions, payload_dict, pick_final_text, turn_id_of, user_text_of_turn
 from codex_im.config import SettingsError, load_settings
 from codex_im.core.admission import Admission
-from codex_im.core.commands import parse_command
+from codex_im.core.commands import Command, parse_command
 from codex_im.core.markup import chunk_text, md_to_telegram_html
 from codex_im.core.types import ChatRef, InboundMessage, SessionKey
 from codex_im.core.workspace import ConfigError, parse_projects, safe_segment
@@ -57,9 +57,10 @@ def test_telegram_html_leaves_snake_case_alone():
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("/stop", ("stop", "")),
-        ("/resume 3", ("resume", "3")),
-        ("/Stop@MyBot", ("stop", "")),
+        ("/stop", Command("stop", "", False)),
+        ("/resume 3", Command("resume", "3", False)),
+        ("/Stop@MyBot", Command("stop", "", True)),
+        ("/release", Command("release", "", False)),
         ("/stop@otherbot", None),
         ("/etc/hosts 是什么", None),
         ("hello", None),
@@ -152,11 +153,11 @@ def test_admission_default_deny():
     assert Admission(env={"FAKE_ALLOW_ALL_USERS": "true"}).allowed("fake", "anyone")
 
 
-def test_provider_admins():
-    adm = Admission(env={}, provider_admins={"telegram:1"})
-    assert adm.is_provider_admin("telegram", "1")
-    assert not adm.is_provider_admin("telegram", "2")
-    assert Admission(env={}).is_provider_admin("telegram", "2")
+def test_admins():
+    adm = Admission(env={}, admins={"telegram:1"})
+    assert adm.is_admin("telegram", "1")
+    assert not adm.is_admin("telegram", "2")
+    assert Admission(env={}).is_admin("telegram", "2")
 
 
 def test_fault_delivery_failures():

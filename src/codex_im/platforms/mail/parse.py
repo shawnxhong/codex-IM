@@ -32,15 +32,21 @@ def is_automated(msg: EmailMessage) -> str | None:
 _MSGID_RE = re.compile(r"<[^<>\s]+>")
 
 
-def thread_root(msg: EmailMessage, message_id: str) -> tuple[str, list[str]]:
-    """-> (root message id used as the session's chat id, references chain)."""
+def reference_ids(msg: EmailMessage) -> tuple[list[str], list[str]]:
+    """-> (References ids in order, In-Reply-To ids)."""
     references = _MSGID_RE.findall(str(msg.get("References") or ""))
     in_reply_to = _MSGID_RE.findall(str(msg.get("In-Reply-To") or ""))
-    if references:
-        return references[0], references
-    if in_reply_to:
-        return in_reply_to[0], in_reply_to
-    return message_id, []
+    return references, in_reply_to
+
+
+def reply_chain(root: str, references: list[str], in_reply_to: list[str], message_id: str, limit: int = 20) -> list[str]:
+    """References for our reply: the session root always first (it must survive truncation, review R8),
+    then the most recent ids."""
+    chain: list[str] = []
+    for mid in [*references, *in_reply_to, message_id]:
+        if mid != root and mid not in chain:
+            chain.append(mid)
+    return [root, *chain[-(limit - 1) :]]
 
 
 class _HTMLText(HTMLParser):

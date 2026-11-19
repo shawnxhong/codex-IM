@@ -17,6 +17,8 @@ CRASH_POINTS = frozenset(
         "crash_after_turn_pending",
         "crash_after_turn_start",
         "crash_before_outbox_send",
+        "crash_after_steer_persist",
+        "crash_after_steer_send",
     }
 )
 FAULT_EXIT_CODE = 77
