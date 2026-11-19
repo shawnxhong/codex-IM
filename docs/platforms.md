@@ -6,7 +6,7 @@
 - 依赖版本是 Hermes 当前锁定的版本，仅作参考，实现时以本项目自己的锁定为准。
 - 各平台的渲染能力（能否编辑消息、单条长度上限、Markdown 方言）在实现适配器时用 `Capabilities` 声明，并回填到本表。
 
-## P0 平台实现要点
+## P0 平台实现要点（P0a：Telegram、Email；P0b：飞书、微信）
 
 | 平台 | 流式输出 | 会话键 | 要点（参考 Hermes 的实现） |
 |---|---|---|---|
@@ -19,18 +19,18 @@
 
 | # | 平台 | 接入方式 | SDK / 依赖（Hermes 参考） | 主要凭证 | 阶段 |
 |---|---|---|---|---|---|
-| 1 | Telegram | Bot API 长轮询（也可选 webhook） | `python-telegram-bot` 22.8 | `TELEGRAM_BOT_TOKEN` | **P0** |
-| 2 | 飞书 / Lark | 开放平台 WebSocket 长连接（也可选 webhook） | `lark-oapi` | `FEISHU_APP_ID` `FEISHU_APP_SECRET` `FEISHU_DOMAIN` | **P0** |
+| 1 | Telegram | Bot API 长轮询（也可选 webhook） | `python-telegram-bot` 22.8 | `TELEGRAM_BOT_TOKEN` | **P0a** |
+| 2 | 飞书 / Lark | 开放平台 WebSocket 长连接（也可选 webhook） | `lark-oapi` | `FEISHU_APP_ID` `FEISHU_APP_SECRET` `FEISHU_DOMAIN` | **P0b** |
 | 3 | Discord | Gateway WebSocket | `discord.py` 2.7.1 | `DISCORD_BOT_TOKEN` | P1 |
 | 4 | Slack | Socket Mode | `slack-bolt` 1.30.0 / `slack-sdk` 3.45.0 | `SLACK_BOT_TOKEN` `SLACK_APP_TOKEN` | P1 |
 | 5 | 钉钉 | Stream 模式 | `dingtalk-stream` ≥0.20 | `DINGTALK_CLIENT_ID` `DINGTALK_CLIENT_SECRET` | P1 |
 | 6 | 企业微信（智能机器人） | WebSocket | 无专用 SDK（自实现） | `WECOM_BOT_ID` `WECOM_SECRET` `WECOM_WEBSOCKET_URL` | P1 |
 | 7 | QQ 机器人 | 官方 Bot API v2：WebSocket 收事件、REST 发消息 | 无专用 SDK（自实现） | `QQ_APP_ID` `QQ_CLIENT_SECRET` | P1 |
-| 8 | 微信（个人号） | 腾讯 iLink Bot API：长轮询 `getupdates`；首次需扫码登录；媒体走 AES-128-ECB 加密的 CDN | 无专用 SDK（自实现） | `WEIXIN_ACCOUNT_ID` `WEIXIN_TOKEN` | **P0** |
+| 8 | 微信（个人号） | 腾讯 iLink Bot API：长轮询 `getupdates`；首次需扫码登录；媒体走 AES-128-ECB 加密的 CDN | 无专用 SDK（自实现） | `WEIXIN_ACCOUNT_ID` `WEIXIN_TOKEN` | **P0b** |
 | 9 | Mattermost | REST v4 + WebSocket 事件流 | 无专用 SDK | `MATTERMOST_URL` `MATTERMOST_TOKEN` | P1 |
 | 10 | Matrix | homeserver sync，可选 E2EE | `mautrix[encryption]` 0.21.1（`python-olm` 只能在 Linux 上构建） | `MATRIX_HOMESERVER` `MATRIX_ACCESS_TOKEN` | P1 |
 | 11 | IRC | TCP/TLS | 标准库 asyncio | `IRC_SERVER` `IRC_CHANNEL` `IRC_NICKNAME` | P1 |
-| 12 | Email | IMAP 轮询 + SMTP 发信 | 标准库 | `EMAIL_ADDRESS` `EMAIL_PASSWORD` `EMAIL_IMAP_HOST` `EMAIL_SMTP_HOST` `EMAIL_AUTHSERV_ID` | **P0** |
+| 12 | Email | IMAP 轮询 + SMTP 发信 | 标准库 | `EMAIL_ADDRESS` `EMAIL_PASSWORD` `EMAIL_IMAP_HOST` `EMAIL_SMTP_HOST` `EMAIL_AUTHSERV_ID` | **P0a** |
 | 13 | ntfy | HTTP 流式订阅 + POST 发布 | httpx | `NTFY_TOPIC` `NTFY_SERVER_URL` `NTFY_TOKEN` | P1 |
 | 14 | Google Chat（Pub/Sub 拉取模式） | Cloud Pub/Sub pull 收事件、REST 发消息 | `google-cloud-pubsub` 2.43.0 | `GOOGLE_CHAT_SERVICE_ACCOUNT_JSON` `GOOGLE_CHAT_PROJECT_ID` `GOOGLE_CHAT_SUBSCRIPTION_NAME` | P1 |
 
@@ -95,4 +95,7 @@
 - [ ] 同一凭证只允许一个运行实例（锁）。
 - [ ] INFO 及以上级别的日志里没有用户内容。
 - [ ] 图片入站（如果平台支持）以原生图片输入交给 Codex。
-- [ ] 有 mock 了平台 API 的单元测试，外加一次真实平台的手工冒烟测试（记录在 PR 里）。
+- [ ] 入站先持久化去重，再向平台确认（D14）；`message_key` 的取法写进本表。
+- [ ] 投递结果走 outbox，正确区分临时失败和永久失败（D14）。
+- [ ] `delivery=async` 的消息作为单独的消息发出（D8、D13）。
+- [ ] 有 mock 了平台 API 的单元测试，外加一次在 Ubuntu 上的真实平台手工冒烟测试（记录在 PR 里）。

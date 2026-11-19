@@ -23,7 +23,7 @@
 | 服务 | 镜像 | 网络 | 说明 |
 |---|---|---|---|
 | `bridge` | `codex-im-bridge:<CODEX_VERSION>` | `im`、`agent_internal` | IM SDK、会话库、`openai-codex` SDK；持有 IM 凭证 |
-| `agent` | `codex-im-agent:<CODEX_VERSION>` | 只接 `agent_internal`（internal） | `socat` 后面接 `codex app-server`；持有工作区和模型凭证 |
+| `agent` | `codex-im-agent:<CODEX_VERSION>` | 只接 `agent_internal`（internal） | `socat` 后面接 `codex app-server`（端口 4500），加上 `agentd`（端口 4501，负责创建目录和 worktree）；持有工作区和模型凭证 |
 | `egress-proxy` | squid（或同类） | `agent_internal`、`egress` | agent 唯一的出网通道，按域名白名单放行 |
 | `ingress`（可选） | caddy | `im`，发布 443 端口 | webhook 平台的 HTTPS 入口，反向代理到 bridge |
 | sidecars（可选） | signal-cli、simplex-chat、wa-bridge 等 | `im` | 通过 compose `profiles` 按需启用 |
@@ -59,8 +59,10 @@ services:
     pids_limit: 512
     mem_limit: 4g
     cpus: 2
-    # entrypoint: 根据环境变量生成 config.toml，然后执行
+    # entrypoint（tini 作为 PID 1）：根据环境变量生成 config.toml，然后启动两个进程：
     #   socat TCP-LISTEN:4500,reuseaddr,fork EXEC:"codex app-server --listen stdio://"
+    #   python -m codex_im.agentd --listen 0.0.0.0:4501
+    # 生成的 config.toml 里固定写入：features.default_mode_request_user_input = false（D13）
 
   bridge:
     image: codex-im-bridge:${CODEX_VERSION}
@@ -103,7 +105,13 @@ services:
   CodexConfig(launch_args_override=("socat", "-", "TCP:agent:4500"))
   ```
 - 这条中继没有鉴权，只依赖 internal 网络和 `range` 限制。可选加固：改成 Unix socket 加共享 volume，或者用 mTLS 的 `socat OPENSSL`。
-- **P0 验证项**：
+### 4.2.1 agentd（D5、D6）
+
+- 提供几个固定的操作：`ensure_dir(session_path)`、`worktree_add(project, session)`、`worktree_remove(project, session)`。不接受任意命令。
+- 以 agent 用户身份运行，权限和 Codex 一样，不构成新的提权面。只监听 internal 网络。
+- 参数里的路径必须在 `/workspace` 下，并做规范化，拒绝 `..` 和符号链接逃逸。
+
+- **P0 验证项**（verification.md V0）：
   - 初始化握手；
   - 多个并发 turn；
   - agent 重启后 bridge 能自动重连并 `thread_resume`；
